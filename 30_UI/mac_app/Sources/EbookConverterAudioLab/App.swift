@@ -18,6 +18,8 @@ struct EbookConverterAudioLabApp: App {
                     model.refreshDockerStatus()
                     model.refreshTTSModels()
                     model.refreshOllamaModels()
+                    model.refreshRuntimeChecks()
+                    model.refreshDesktopPDFs()
                 }
         }
         .commands {
@@ -65,6 +67,20 @@ final class AppModel: ObservableObject {
             switch self {
             case .left: return "← 左キー"
             case .right: return "→ 右キー"
+            }
+        }
+    }
+
+    enum UILanguage: String, CaseIterable, Identifiable {
+        case ja
+        case en
+
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .ja: return "日本語"
+            case .en: return "English"
             }
         }
     }
@@ -133,6 +149,7 @@ final class AppModel: ObservableObject {
         }
     }
 
+    @Published var uiLanguage: UILanguage = .ja
     @Published var ebookURL: URL?
     @Published var sourceURLText = ""
     @Published var pageTurnDirection: PageTurnDirection = .right
@@ -148,6 +165,11 @@ final class AppModel: ObservableObject {
     @Published var ollamaPullName = "gemma3:4b"
     @Published private(set) var isRefreshingOllama = false
     @Published private(set) var ollamaStatusMessage = "未確認"
+    @Published private(set) var isTestingOllama = false
+    @Published private(set) var ollamaTestOutput = ""
+    @Published var maxPagesSetting = "1000"
+    @Published private(set) var runtimeChecks: [(name: String, ok: Bool, detail: String)] = []
+    @Published private(set) var desktopPDFs: [URL] = []
     @Published var voiceURL: URL?
     @Published var customModelURL: URL?
     @Published var language = "jpn"
@@ -215,6 +237,10 @@ final class AppModel: ObservableObject {
         }
         return URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
             .appendingPathComponent("Desktop", isDirectory: true)
+    }
+
+    func t(_ ja: String, _ en: String) -> String {
+        uiLanguage == .ja ? ja : en
     }
 
     var trimmedSourceURL: String {
@@ -375,6 +401,7 @@ final class AppModel: ObservableObject {
                 self.statusMessage = "PDF取得完了"
                 self.progressText = "100%"
                 self.remainingText = "00:00"
+                self.refreshDesktopPDFs()
                 self.appendLog("\nMerged PDF saved to: \(mergedURL.path)\n")
             } catch {
                 self.preflightTask = nil
@@ -505,6 +532,92 @@ final class AppModel: ObservableObject {
             } else {
                 self.fail("Ollamaモデルのダウンロードに失敗しました (exit \(exitCode))。")
             }
+        }
+    }
+
+    func refreshRuntimeChecks() {
+        let pythonPath = resolvePythonCommand()
+        let ffmpegPath = findExecutable(["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"])
+        let sayOk = FileManager.default.isExecutableFile(atPath: "/usr/bin/say")
+        let chromeOk = FileManager.default.isExecutableFile(atPath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+        let ollamaPath = resolveOllamaCommand()
+        let dockerOk = dockerReady
+
+        runtimeChecks = [
+            ("Python 3", pythonPath != nil, pythonPath ?? "未検出"),
+            ("Google Chrome (CDP)", chromeOk, chromeOk ? "利用可能" : "未検出"),
+            ("macOS 音声合成 (say)", sayOk, sayOk ? "/usr/bin/say" : "未検出"),
+            ("ffmpeg (MP3/M4B変換)", ffmpegPath != nil, ffmpegPath ?? "未検出"),
+            ("Ollama (ローカルLLM)", ollamaPath != nil, ollamaStatusMessage),
+            ("Docker (任意)", dockerOk, dockerStatus),
+        ]
+    }
+
+    func refreshDesktopPDFs() {
+        let dir = fetchedPDFRoot
+        let urls = (try? FileManager.default.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+
+        desktopPDFs = urls
+            .filter { $0.pathExtension.lowercased() == "pdf" }
+            .sorted { lhs, rhs in
+                let d1 = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let d2 = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                return d1 > d2
+            }
+    }
+
+    func clearLog() {
+        logText = "Ready."
+    }
+
+    func copyLogToPasteboard() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(logText, forType: .string)
+    }
+
+    func testOllamaInference() {
+        let modelName = selectedOllamaModelName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !modelName.isEmpty else {
+            ollamaTestOutput = "先にモデルを選択してください。"
+            return
+        }
+        isTestingOllama = true
+        ollamaTestOutput = "推論テスト中..."
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                guard let url = URL(string: "http://127.0.0.1:11434/api/generate") else { return }
+                var request = URLRequest(url: url)
+                request.httpMethod = "POST"
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.timeoutInterval = 30
+                let body: [String: Any] = [
+                    "model": modelName,
+                    "prompt": "Reply with OK.",
+                    "stream": false,
+                ]
+                request.httpBody = try JSONSerialization.data(withJSONObject: body)
+                let started = Date()
+                let (data, _) = try await URLSession.shared.data(for: request)
+                let elapsed = Date().timeIntervalSince(started)
+                if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let resp = json["response"] as? String {
+                    let evalCount = json["eval_count"] as? Int ?? 0
+                    let evalDuration = (json["eval_duration"] as? Double ?? 0) / 1e9
+                    let tps = evalDuration > 0 ? Double(evalCount) / evalDuration : 0
+                    self.ollamaTestOutput = String(format: "応答: %@ (%.2fs / %.1f tok/s)", resp.trimmingCharacters(in: .whitespacesAndNewlines), elapsed, tps)
+                } else {
+                    self.ollamaTestOutput = "応答を解析できませんでした。"
+                }
+            } catch {
+                self.ollamaTestOutput = "テスト失敗: \(error.localizedDescription)"
+            }
+            self.isTestingOllama = false
         }
     }
 
@@ -1057,11 +1170,13 @@ final class AppModel: ObservableObject {
         return try await withCheckedThrowingContinuation { continuation in
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: pythonCommand)
+            let maxPages = Int(maxPagesSetting.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 1000
             proc.arguments = [
                 scriptURL.path,
                 "--url", urlString,
                 "--output", outputURL.path,
                 "--direction", pageTurnDirection.rawValue,
+                "--max-pages", String(max(1, maxPages)),
             ]
             proc.currentDirectoryURL = fetchedPDFRoot
 
@@ -1480,28 +1595,40 @@ final class AppModel: ObservableObject {
 
 struct ContentView: View {
     enum Destination: String, CaseIterable, Identifiable {
+        case runtime
+        case dashboard
         case urlToPDF
         case audioLab
+        case library
         case models
         case logs
+        case settings
 
         var id: String { rawValue }
 
-        var title: String {
+        func title(_ lang: AppModel.UILanguage) -> String {
             switch self {
-            case .urlToPDF: return "URL → PDF 作成"
-            case .audioLab: return "音声変換 (Audio Lab)"
-            case .models: return "LLM / モデル"
-            case .logs: return "環境・実行ログ"
+            case .runtime: return lang == .ja ? "実行環境" : "Runtime"
+            case .dashboard: return lang == .ja ? "ダッシュボード" : "Dashboard"
+            case .urlToPDF: return lang == .ja ? "URL → PDF 作成" : "URL to PDF"
+            case .audioLab: return lang == .ja ? "音声変換 (Audio Lab)" : "Audio Lab"
+            case .library: return lang == .ja ? "PDFライブラリ" : "PDF Library"
+            case .models: return lang == .ja ? "LLM / モデル" : "LLM / Models"
+            case .logs: return lang == .ja ? "ログ" : "Logs"
+            case .settings: return lang == .ja ? "システム設定" : "Settings"
             }
         }
 
         var symbol: String {
             switch self {
+            case .runtime: return "desktopcomputer"
+            case .dashboard: return "square.grid.2x2"
             case .urlToPDF: return "doc.text.magnifyingglass"
             case .audioLab: return "waveform"
+            case .library: return "books.vertical"
             case .models: return "brain"
             case .logs: return "terminal"
+            case .settings: return "gearshape"
             }
         }
     }
@@ -1512,17 +1639,27 @@ struct ContentView: View {
     var body: some View {
         NavigationSplitView {
             List(selection: $destination) {
-                Section("ワークスペース") {
-                    Label(Destination.urlToPDF.title, systemImage: Destination.urlToPDF.symbol)
-                        .tag(Destination.urlToPDF)
-                    Label(Destination.audioLab.title, systemImage: Destination.audioLab.symbol)
-                        .tag(Destination.audioLab)
+                Section("Mac") {
+                    Label(Destination.runtime.title(model.uiLanguage), systemImage: Destination.runtime.symbol)
+                        .tag(Destination.runtime)
                 }
-                Section("システム") {
-                    Label(Destination.models.title, systemImage: Destination.models.symbol)
+                Section(model.t("機能", "Features")) {
+                    Label(Destination.dashboard.title(model.uiLanguage), systemImage: Destination.dashboard.symbol)
+                        .tag(Destination.dashboard)
+                    Label(Destination.urlToPDF.title(model.uiLanguage), systemImage: Destination.urlToPDF.symbol)
+                        .tag(Destination.urlToPDF)
+                    Label(Destination.audioLab.title(model.uiLanguage), systemImage: Destination.audioLab.symbol)
+                        .tag(Destination.audioLab)
+                    Label(Destination.library.title(model.uiLanguage), systemImage: Destination.library.symbol)
+                        .tag(Destination.library)
+                }
+                Section(model.t("システム", "System")) {
+                    Label(Destination.models.title(model.uiLanguage), systemImage: Destination.models.symbol)
                         .tag(Destination.models)
-                    Label(Destination.logs.title, systemImage: Destination.logs.symbol)
+                    Label(Destination.logs.title(model.uiLanguage), systemImage: Destination.logs.symbol)
                         .tag(Destination.logs)
+                    Label(Destination.settings.title(model.uiLanguage), systemImage: Destination.settings.symbol)
+                        .tag(Destination.settings)
                 }
             }
             .navigationTitle("WebTPDF Mac")
@@ -1530,12 +1667,12 @@ struct ContentView: View {
             .safeAreaInset(edge: .bottom) {
                 VStack(alignment: .leading, spacing: 4) {
                     Label(
-                        model.isRunning ? "処理中..." : model.statusMessage,
+                        model.isRunning ? model.t("処理中...", "Running...") : model.statusMessage,
                         systemImage: model.isRunning ? "record.circle" : (model.dockerReady ? "checkmark.circle" : "pause.circle")
                     )
                     .font(.callout)
                     .lineLimit(1)
-                    Text(model.audioEngineMode == .local ? "MacローカルTTS Ready (Docker不要)" : model.dockerStatus)
+                    Text(model.audioEngineMode == .local ? model.t("MacローカルTTS Ready (Docker不要)", "Local Mac TTS Ready (No Docker)") : model.dockerStatus)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -1546,47 +1683,65 @@ struct ContentView: View {
         } detail: {
             Group {
                 switch destination ?? .urlToPDF {
+                case .runtime:
+                    runtimeView
+                case .dashboard:
+                    dashboardView
                 case .urlToPDF:
                     urlToPDFView
                 case .audioLab:
                     audioLabView
+                case .library:
+                    libraryView
                 case .models:
                     modelsView
                 case .logs:
                     systemLogsView
+                case .settings:
+                    settingsView
                 }
             }
-            .navigationTitle((destination ?? .urlToPDF).title)
+            .navigationTitle((destination ?? .urlToPDF).title(model.uiLanguage))
             .toolbar {
                 ToolbarItemGroup {
                     if model.isRunning {
                         ProgressView()
                             .controlSize(.small)
                     }
+                    Menu {
+                        Picker(model.t("言語", "Language"), selection: $model.uiLanguage) {
+                            ForEach(AppModel.UILanguage.allCases) { lang in
+                                Text(lang.label).tag(lang)
+                            }
+                        }
+                    } label: {
+                        Label(model.uiLanguage.label, systemImage: "globe")
+                    }
                     Button {
                         model.launchLoginBrowser()
                     } label: {
-                        Label("ログイン用ブラウザ", systemImage: "safari")
+                        Label(model.t("ログイン用ブラウザ", "Login Browser"), systemImage: "safari")
                     }
                     .disabled(model.isRunning)
 
                     Button {
                         model.refreshDockerStatus()
+                        model.refreshRuntimeChecks()
                     } label: {
-                        Label("Docker再確認", systemImage: "arrow.clockwise")
+                        Label(model.t("再診断", "Refresh"), systemImage: "arrow.clockwise")
                     }
 
                     Button {
                         model.openOutputDirectory()
                     } label: {
-                        Label("出力フォルダ", systemImage: "folder")
+                        Label(model.t("出力フォルダ", "Output Folder"), systemImage: "folder")
                     }
 
                     if model.isRunning {
                         Button(role: .destructive) {
                             model.cancelJob()
                         } label: {
-                            Label("停止", systemImage: "stop.fill")
+                            Label(model.t("停止", "Stop"), systemImage: "stop.fill")
                         }
                         .keyboardShortcut(".", modifiers: [.command])
                     }
@@ -1599,38 +1754,38 @@ struct ContentView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Webページから1枚のPDFを作成")
+                    Text(model.t("Webページから1枚のPDFを作成", "Create a Single PDF from a Web Page"))
                         .font(.title2.bold())
-                    Text("対象URLを開き、指定方向のカーソルキーでページ送りしながら全ページを結合してデスクトップに保存します。")
+                    Text(model.t("対象URLを開き、指定方向のカーソルキーでページ送りしながら全ページを結合してデスクトップに保存します。", "Opens the target URL, turns pages with the selected arrow key, and saves a merged PDF to your Desktop."))
                         .foregroundStyle(.secondary)
                 }
 
                 HStack(spacing: 12) {
-                    topologyCard("ソースURL", symbol: "globe", detail: model.trimmedSourceURL.isEmpty ? "未入力" : "入力済み")
+                    topologyCard(model.t("ソースURL", "Source URL"), symbol: "globe", detail: model.trimmedSourceURL.isEmpty ? model.t("未入力", "Empty") : model.t("入力済み", "Ready"))
                     Image(systemName: "chevron.right").foregroundStyle(.secondary)
-                    topologyCard("ページ送り", symbol: model.pageTurnDirection == .left ? "arrow.left.square" : "arrow.right.square", detail: model.pageTurnDirection.label)
+                    topologyCard(model.t("ページ送り", "Pagination"), symbol: model.pageTurnDirection == .left ? "arrow.left.square" : "arrow.right.square", detail: model.pageTurnDirection.label)
                     Image(systemName: "chevron.right").foregroundStyle(.secondary)
-                    topologyCard("Desktop保存", symbol: "doc.richtext", detail: model.fetchedPDFURL?.lastPathComponent ?? "待機中")
+                    topologyCard(model.t("Desktop保存", "Save to Desktop"), symbol: "doc.richtext", detail: model.fetchedPDFURL?.lastPathComponent ?? model.t("待機中", "Waiting"))
                 }
                 .padding(20)
                 .frame(maxWidth: .infinity)
                 .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 12))
 
-                GroupBox("URL取得設定") {
+                GroupBox(model.t("URL取得設定", "Capture Settings")) {
                     VStack(alignment: .leading, spacing: 14) {
                         VStack(alignment: .leading, spacing: 6) {
-                            Text("ソースURL（PDF / ページ送り対象サイト）")
+                            Text(model.t("ソースURL（PDF / ページ送り対象サイト）", "Source URL (PDF or paginated web viewer)"))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                            TextField("https://... (PDF / ページ送り対象URL)", text: $model.sourceURLText)
+                            TextField("https://... (PDF / URL)", text: $model.sourceURLText)
                                 .textFieldStyle(.roundedBorder)
                         }
 
                         HStack(spacing: 12) {
-                            Text("ページ送り方向")
+                            Text(model.t("ページ送り方向", "Page Turn Key"))
                                 .font(.callout)
                                 .foregroundStyle(.secondary)
-                            Picker("ページ送り方向", selection: $model.pageTurnDirection) {
+                            Picker(model.t("ページ送り方向", "Page Turn Key"), selection: $model.pageTurnDirection) {
                                 ForEach(AppModel.PageTurnDirection.allCases) { dir in
                                     Text(dir.label).tag(dir)
                                 }
@@ -1642,38 +1797,38 @@ struct ContentView: View {
                         }
 
                         HStack(spacing: 10) {
-                            Button("URLからPDF作成（Desktop保存）") {
+                            Button(model.t("URLからPDF作成（Desktop保存）", "Create PDF to Desktop")) {
                                 model.fetchPDFfromURL()
                             }
                             .buttonStyle(.borderedProminent)
                             .disabled(!model.canFetchURL)
 
-                            Button("ログイン用ブラウザを開く") {
+                            Button(model.t("ログイン用ブラウザを開く", "Open Login Browser")) {
                                 model.launchLoginBrowser()
                             }
                             .disabled(model.isRunning)
 
                             if model.isRunning {
-                                Button("キャンセル", role: .destructive) {
+                                Button(model.t("キャンセル", "Cancel"), role: .destructive) {
                                     model.cancelJob()
                                 }
                             }
                         }
 
-                        Text("認証が必要なサイト（O'Reilly等）は「ログイン用ブラウザを開く」からログイン後に実行してください。")
+                        Text(model.t("認証が必要なサイト（O'Reilly等）は「ログイン用ブラウザを開く」からログイン後に実行してください。", "For sites requiring sign-in (e.g. O'Reilly), open the Login Browser, sign in, and then create the PDF."))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                     .padding(8)
                 }
 
-                GroupBox("準備状況・保存結果") {
+                GroupBox(model.t("準備状況・保存結果", "Status & Result")) {
                     VStack(spacing: 0) {
-                        StatusRow(title: "ステータス", value: model.statusMessage, symbol: "info.circle")
+                        StatusRow(title: model.t("ステータス", "Status"), value: model.statusMessage, symbol: "info.circle")
                         Divider()
-                        StatusRow(title: "経過時間", value: model.elapsedText, symbol: "clock")
+                        StatusRow(title: model.t("経過時間", "Elapsed"), value: model.elapsedText, symbol: "clock")
                         Divider()
-                        StatusRow(title: "保存済みPDF", value: model.fetchedPDFURL?.path ?? "未作成", symbol: "doc.fill")
+                        StatusRow(title: model.t("保存済みPDF", "Saved PDF"), value: model.fetchedPDFURL?.path ?? model.t("未作成", "None"), symbol: "doc.fill")
                     }
                     if model.isRunning {
                         ProgressView()
@@ -1681,7 +1836,7 @@ struct ContentView: View {
                     }
                     if model.fetchedPDFURL != nil {
                         HStack {
-                            Button("DesktopのPDFを開く") {
+                            Button(model.t("DesktopのPDFを開く", "Open Desktop PDF")) {
                                 model.openFetchedPDF()
                             }
                             .buttonStyle(.bordered)
@@ -1701,28 +1856,28 @@ struct ContentView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("電子書籍をオーディオブックに変換")
+                    Text(model.t("電子書籍をオーディオブックに変換", "Convert Ebooks to Audiobooks"))
                         .font(.title2.bold())
-                    Text("ローカルの PDF / EPUB / MOBI または取得済みPDFを `ebook2audiobook` で音声化します。")
+                    Text(model.t("ローカルの PDF / EPUB / TXT または取得済みPDFを音声化します（Docker不要のローカルTTSに対応）。", "Convert local or fetched PDF / EPUB / TXT into mp3 or m4b audio (works locally without Docker)."))
                         .foregroundStyle(.secondary)
                 }
 
                 inputGroup
 
                 HStack {
-                    Button("音声変換を開始 (mp3/m4b)") {
+                    Button(model.t("音声変換を開始 (mp3/m4b)", "Start Audio Conversion (mp3/m4b)")) {
                         model.startJob()
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(!model.canRun)
 
-                    Button("キャンセル") {
+                    Button(model.t("キャンセル", "Cancel")) {
                         model.cancelJob()
                     }
                     .disabled(!model.isRunning)
                 }
 
-                GroupBox("変換結果") {
+                GroupBox(model.t("変換結果", "Output")) {
                     VStack(spacing: 0) {
                         StatusRow(title: "ステータス", value: model.statusMessage, symbol: "waveform")
                         Divider()
@@ -1811,6 +1966,19 @@ struct ContentView: View {
                                         if let size = selected.size {
                                             LabeledContent("サイズ", value: ByteCountFormatter.string(fromByteCount: size, countStyle: .file))
                                         }
+                                        HStack(spacing: 10) {
+                                            Button("推論テスト", systemImage: "waveform.path.ecg") {
+                                                model.testOllamaInference()
+                                            }
+                                            .disabled(model.isTestingOllama)
+                                            if model.isTestingOllama {
+                                                ProgressView().controlSize(.small)
+                                            } else if !model.ollamaTestOutput.isEmpty {
+                                                Text(model.ollamaTestOutput)
+                                                    .font(.caption)
+                                                    .foregroundStyle(.secondary)
+                                            }
+                                        }
                                     }
                                     .padding(4)
                                 }
@@ -1855,6 +2023,219 @@ struct ContentView: View {
         }
     }
 
+    private var runtimeView: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("実行環境の診断")
+                        .font(.title2.bold())
+                    Text("URLからのPDF取得・ローカル音声変換・LLM連携に必要なコンポーネントの状態を確認します。")
+                        .foregroundStyle(.secondary)
+                }
+
+                GroupBox("ランタイム診断") {
+                    VStack(spacing: 0) {
+                        ForEach(Array(model.runtimeChecks.enumerated()), id: \.offset) { idx, check in
+                            HStack {
+                                Label(
+                                    check.name,
+                                    systemImage: check.ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+                                )
+                                .foregroundStyle(check.ok ? .primary : .secondary)
+                                Spacer()
+                                Text(check.detail)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                            .padding(.vertical, 8)
+                            .padding(.horizontal, 4)
+                            if idx < model.runtimeChecks.count - 1 {
+                                Divider()
+                            }
+                        }
+                    }
+                }
+
+                HStack {
+                    Button("再診断", systemImage: "arrow.clockwise") {
+                        model.refreshDockerStatus()
+                        model.refreshOllamaModels()
+                        model.refreshRuntimeChecks()
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+            .padding(28)
+        }
+    }
+
+    private var dashboardView: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("WebTPDF Mac ダッシュボード")
+                        .font(.title2.bold())
+                    Text("WebページのPDF化とローカル音声変換の状況を一目で確認できます。")
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack(spacing: 12) {
+                    topologyCard("Desktop PDF", symbol: "doc.fill", detail: "\(model.desktopPDFs.count)件")
+                    Image(systemName: "chevron.right").foregroundStyle(.secondary)
+                    topologyCard("音声エンジン", symbol: "waveform", detail: model.audioEngineMode.label)
+                    Image(systemName: "chevron.right").foregroundStyle(.secondary)
+                    topologyCard("ローカルLLM", symbol: "brain", detail: "\(model.ollamaModels.count)件")
+                }
+                .padding(20)
+                .frame(maxWidth: .infinity)
+                .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 12))
+
+                HStack(spacing: 12) {
+                    Button("URL → PDF 作成を開く") { destination = .urlToPDF }
+                        .buttonStyle(.borderedProminent)
+                    Button("音声変換を開く") { destination = .audioLab }
+                    Button("LLM / モデルを開く") { destination = .models }
+                }
+
+                GroupBox("最近のDesktop PDF") {
+                    if model.desktopPDFs.isEmpty {
+                        Text("DesktopにPDFがありません。")
+                            .foregroundStyle(.secondary)
+                            .padding(8)
+                    } else {
+                        VStack(spacing: 0) {
+                            ForEach(Array(model.desktopPDFs.prefix(5).enumerated()), id: \.element) { idx, pdf in
+                                HStack {
+                                    Label(pdf.lastPathComponent, systemImage: "doc.richtext")
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                    Spacer()
+                                    Button("開く") { NSWorkspace.shared.open(pdf) }
+                                    Button("音声化へ") {
+                                        model.ebookURL = pdf
+                                        destination = .audioLab
+                                    }
+                                }
+                                .padding(.vertical, 6)
+                                if idx < min(4, model.desktopPDFs.count - 1) {
+                                    Divider()
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(28)
+        }
+    }
+
+    private var libraryView: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("PDFライブラリ (Desktop)")
+                            .font(.title2.bold())
+                        Text("デスクトップに保存されているPDFを閲覧・音声変換にそのまま送れます。")
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("再読み込み", systemImage: "arrow.clockwise") {
+                        model.refreshDesktopPDFs()
+                    }
+                }
+
+                GroupBox("PDF一覧 (\(model.desktopPDFs.count)件)") {
+                    if model.desktopPDFs.isEmpty {
+                        Text("DesktopにPDFが見つかりませんでした。")
+                            .foregroundStyle(.secondary)
+                            .padding(12)
+                    } else {
+                        VStack(spacing: 0) {
+                            ForEach(Array(model.desktopPDFs.enumerated()), id: \.element) { idx, pdf in
+                                HStack(spacing: 10) {
+                                    Label(pdf.lastPathComponent, systemImage: "doc.fill")
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                    Spacer()
+                                    Button("開く") { NSWorkspace.shared.open(pdf) }
+                                    Button("Finder") {
+                                        NSWorkspace.shared.activateFileViewerSelecting([pdf])
+                                    }
+                                    Button("音声変換へ") {
+                                        model.ebookURL = pdf
+                                        destination = .audioLab
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                }
+                                .padding(.vertical, 8)
+                                if idx < model.desktopPDFs.count - 1 {
+                                    Divider()
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(28)
+        }
+    }
+
+    private var settingsView: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("システム設定")
+                        .font(.title2.bold())
+                    Text("ページ送りやPDF保存・音声変換の既定値を設定します。")
+                        .foregroundStyle(.secondary)
+                }
+
+                GroupBox("PDF取得設定") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            Text("既定のページ送り方向")
+                            Spacer()
+                            Picker("ページ送り方向", selection: $model.pageTurnDirection) {
+                                ForEach(AppModel.PageTurnDirection.allCases) { dir in
+                                    Text(dir.label).tag(dir)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                            .frame(maxWidth: 220)
+                        }
+                        Divider()
+                        HStack {
+                            Text("最大ページ送り数")
+                            Spacer()
+                            TextField("1000", text: $model.maxPagesSetting)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 100)
+                        }
+                    }
+                    .padding(8)
+                }
+
+                GroupBox("音声変換の既定値") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Picker("実行エンジン", selection: $model.audioEngineMode) {
+                            ForEach(AppModel.AudioEngineMode.allCases) { mode in
+                                Text(mode.label).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        languageAndFormatRow
+                    }
+                    .padding(8)
+                }
+            }
+            .padding(28)
+        }
+    }
+
     private var systemLogsView: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
@@ -1872,6 +2253,15 @@ struct ContentView: View {
                         StatusRow(title: "取得済みPDF", value: model.fetchedPDFURL?.path ?? "-", symbol: "doc.fill")
                         Divider()
                         StatusRow(title: "出力フォルダ", value: model.outputDirectory?.path ?? "-", symbol: "folder")
+                    }
+                }
+
+                HStack {
+                    Button("ログをコピー", systemImage: "doc.on.doc") {
+                        model.copyLogToPasteboard()
+                    }
+                    Button("ログをクリア", systemImage: "trash") {
+                        model.clearLog()
                     }
                 }
 

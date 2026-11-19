@@ -26,6 +26,7 @@ swiftc \
   -parse-as-library \
   -o "$EXECUTABLE" \
   "$SCRIPT_DIR/Sources/EbookConverterAudioLab/App.swift" \
+  "$SCRIPT_DIR/Sources/EbookConverterAudioLab/PDFLibraryPreferences.swift" \
   -framework SwiftUI \
   -framework AVFoundation \
   -framework PDFKit \

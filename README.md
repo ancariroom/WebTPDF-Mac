@@ -76,10 +76,14 @@ python3 30_UI/audiobook_ui.py
 
 ```bash
 zsh 30_UI/mac_app/build_mac_app.sh
-open "40_Ops/apps/EbookConverter Audio Lab.app"
+open "40_Ops/apps/WebTPDF Mac.app"
 ```
 
 アプリは Docker Desktop を直接起動し、ログ、出力先、音声再生を画面内で扱います。配布先のMacに Node / Python は不要です。詳細は `00_Docs/RUNBOOK_mac_app.md` を参照してください。
+
+PDFライブラリの「フォルダーを選択」で表示する場所を変更できます。初期値はDesktopです。ダッシュボードの「最近のPDF」は、行ごとに削除するか「履歴を消去」でまとめて外せます。PDF本体はライブラリに残ります。音声モデルの選択・ダウンロードは音声変換、Ollamaの操作はローカルLLMにあります。ツールバーの「日本語」「English」で直接切り替えられます。
+
+**English:** Use **Choose Folder** in **PDF Library** to browse another folder. Remove individual recent entries or use **Clear History** on the dashboard to hide them from the recent list. Your PDF files stay in the library. Audio Lab manages voices and Local LLM manages Ollama models. Select **日本語** or **English** directly in the toolbar.
 
 長いPDFでまず声質だけ確認したい場合は、アプリ内の `短い範囲だけ試す（PDF先頭ページ）` をONにすると、先頭Nページだけの一時PDFを作って変換できます。
 

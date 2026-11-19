@@ -19,7 +19,7 @@ struct EbookConverterAudioLabApp: App {
                     model.refreshTTSModels()
                     model.refreshOllamaModels()
                     model.refreshRuntimeChecks()
-                    model.refreshDesktopPDFs()
+                    model.refreshLibraryPDFs()
                 }
         }
         .commands {
@@ -169,7 +169,15 @@ final class AppModel: ObservableObject {
     @Published private(set) var ollamaTestOutput = ""
     @Published var maxPagesSetting = "1000"
     @Published private(set) var runtimeChecks: [(name: String, ok: Bool, detail: String)] = []
-    @Published private(set) var desktopPDFs: [URL] = []
+    @Published private(set) var libraryPDFs: [URL] = []
+    @Published private(set) var libraryFolder = PDFLibraryPreferences().folder
+    @Published private(set) var libraryError: String?
+    @Published private var hiddenRecentPDFPaths = PDFLibraryPreferences().hiddenRecentPaths
+    private let libraryPreferences = PDFLibraryPreferences()
+
+    var recentPDFs: [URL] {
+        Array(libraryPDFs.lazy.filter { !self.hiddenRecentPDFPaths.contains($0.path) }.prefix(5))
+    }
     @Published var voiceURL: URL?
     @Published var customModelURL: URL?
     @Published var language = "jpn"
@@ -401,7 +409,7 @@ final class AppModel: ObservableObject {
                 self.statusMessage = "PDF取得完了"
                 self.progressText = "100%"
                 self.remainingText = "00:00"
-                self.refreshDesktopPDFs()
+                self.refreshLibraryPDFs()
                 self.appendLog("\nMerged PDF saved to: \(mergedURL.path)\n")
             } catch {
                 self.preflightTask = nil
@@ -553,21 +561,41 @@ final class AppModel: ObservableObject {
         ]
     }
 
-    func refreshDesktopPDFs() {
-        let dir = fetchedPDFRoot
-        let urls = (try? FileManager.default.contentsOfDirectory(
-            at: dir,
-            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
-            options: [.skipsHiddenFiles]
-        )) ?? []
+    func chooseLibraryFolder() {
+        let panel = NSOpenPanel()
+        panel.title = t("PDFライブラリのフォルダーを選択", "Choose PDF Library Folder")
+        panel.prompt = t("選択", "Choose")
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = libraryFolder
+        guard panel.runModal() == .OK, let folder = panel.url else { return }
+        libraryFolder = folder.standardizedFileURL
+        libraryPreferences.saveFolder(libraryFolder)
+        refreshLibraryPDFs()
+    }
 
-        desktopPDFs = urls
-            .filter { $0.pathExtension.lowercased() == "pdf" }
-            .sorted { lhs, rhs in
-                let d1 = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                let d2 = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                return d1 > d2
-            }
+    func refreshLibraryPDFs() {
+        do {
+            libraryPDFs = try PDFLibraryPreferences.pdfs(in: libraryFolder)
+            libraryError = nil
+        } catch {
+            libraryPDFs = []
+            libraryError = error.localizedDescription
+        }
+    }
+
+    func hideRecentPDF(_ url: URL) {
+        hideRecentPDFs([url])
+    }
+
+    func clearRecentPDFs() {
+        hideRecentPDFs(libraryPDFs)
+    }
+
+    private func hideRecentPDFs(_ urls: [URL]) {
+        hiddenRecentPDFPaths.formUnion(urls.map(\.path))
+        libraryPreferences.saveHiddenRecentPaths(hiddenRecentPDFPaths)
     }
 
     func clearLog() {
@@ -1613,7 +1641,7 @@ struct ContentView: View {
             case .urlToPDF: return lang == .ja ? "URL → PDF 作成" : "URL to PDF"
             case .audioLab: return lang == .ja ? "音声変換 (Audio Lab)" : "Audio Lab"
             case .library: return lang == .ja ? "PDFライブラリ" : "PDF Library"
-            case .models: return lang == .ja ? "LLM / モデル" : "LLM / Models"
+            case .models: return lang == .ja ? "ローカルLLM" : "Local LLM"
             case .logs: return lang == .ja ? "ログ" : "Logs"
             case .settings: return lang == .ja ? "システム設定" : "Settings"
             }
@@ -1635,6 +1663,7 @@ struct ContentView: View {
 
     @ObservedObject var model: AppModel
     @State private var destination: Destination? = .urlToPDF
+    @State private var confirmClearRecentPDFs = false
 
     var body: some View {
         NavigationSplitView {
@@ -1708,15 +1737,14 @@ struct ContentView: View {
                         ProgressView()
                             .controlSize(.small)
                     }
-                    Menu {
-                        Picker(model.t("言語", "Language"), selection: $model.uiLanguage) {
-                            ForEach(AppModel.UILanguage.allCases) { lang in
-                                Text(lang.label).tag(lang)
-                            }
+                    Picker(model.t("言語", "Language"), selection: $model.uiLanguage) {
+                        ForEach(AppModel.UILanguage.allCases) { lang in
+                            Text(lang.label).tag(lang)
                         }
-                    } label: {
-                        Label(model.uiLanguage.label, systemImage: "globe")
                     }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .accessibilityLabel(model.t("言語", "Language"))
                     Button {
                         model.launchLoginBrowser()
                     } label: {
@@ -1815,7 +1843,7 @@ struct ContentView: View {
                             }
                         }
 
-                        Text(model.t("認証が必要なサイト（O'Reilly等）は「ログイン用ブラウザを開く」からログイン後に実行してください。", "For sites requiring sign-in (e.g. O'Reilly), open the Login Browser, sign in, and then create the PDF."))
+                        Text(model.t("認証が必要なサイトは「ログイン用ブラウザを開く」からログイン後に実行してください。", "For sites requiring sign-in, open the Login Browser, sign in, and then create the PDF."))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -1920,9 +1948,9 @@ struct ContentView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("LLM / 音声モデル管理")
+                    Text(model.t("ローカルLLMの管理", "Manage Local LLMs"))
                         .font(.title2.bold())
-                    Text("ローカル LLM（Ollama）と音声合成モデルの選択・ダウンロードを行います。")
+                    Text(model.t("Ollamaの言語モデルを選択・ダウンロードし、推論を確認できます。", "Select and download Ollama language models, and test inference."))
                         .foregroundStyle(.secondary)
                 }
 
@@ -2000,23 +2028,6 @@ struct ContentView: View {
                     .padding(8)
                 }
 
-                GroupBox("音声合成モデル (TTS / Docker不要)") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        localModelSection
-                        if let selectedTTS = model.availableTTSModels.first(where: { $0.id == model.selectedTTSModelID }) {
-                            GroupBox {
-                                VStack(alignment: .leading, spacing: 8) {
-                                    LabeledContent("エンジン", value: selectedTTS.engine)
-                                    LabeledContent("言語", value: selectedTTS.language)
-                                    LabeledContent("状態", value: selectedTTS.installed ? "インストール済み" : "未ダウンロード")
-                                }
-                                .padding(4)
-                            }
-                        }
-                    }
-                    .padding(8)
-                }
-
                 logBox(minHeight: 160)
             }
             .padding(28)
@@ -2082,7 +2093,7 @@ struct ContentView: View {
                 }
 
                 HStack(spacing: 12) {
-                    topologyCard("Desktop PDF", symbol: "doc.fill", detail: "\(model.desktopPDFs.count)件")
+                    topologyCard(model.t("PDFライブラリ", "PDF Library"), symbol: "doc.fill", detail: "\(model.libraryPDFs.count)")
                     Image(systemName: "chevron.right").foregroundStyle(.secondary)
                     topologyCard("音声エンジン", symbol: "waveform", detail: model.audioEngineMode.label)
                     Image(systemName: "chevron.right").foregroundStyle(.secondary)
@@ -2096,35 +2107,59 @@ struct ContentView: View {
                     Button("URL → PDF 作成を開く") { destination = .urlToPDF }
                         .buttonStyle(.borderedProminent)
                     Button("音声変換を開く") { destination = .audioLab }
-                    Button("LLM / モデルを開く") { destination = .models }
+                    Button(model.t("ローカルLLMを開く", "Open Local LLM")) { destination = .models }
                 }
 
-                GroupBox("最近のDesktop PDF") {
-                    if model.desktopPDFs.isEmpty {
-                        Text("DesktopにPDFがありません。")
+                GroupBox {
+                    let recent = model.recentPDFs
+                    if recent.isEmpty {
+                        Text(model.t("最近のPDFはありません。", "No recent PDFs."))
                             .foregroundStyle(.secondary)
                             .padding(8)
                     } else {
                         VStack(spacing: 0) {
-                            ForEach(Array(model.desktopPDFs.prefix(5).enumerated()), id: \.element) { idx, pdf in
+                            ForEach(Array(recent.enumerated()), id: \.element) { idx, pdf in
                                 HStack {
                                     Label(pdf.lastPathComponent, systemImage: "doc.richtext")
                                         .lineLimit(1)
                                         .truncationMode(.middle)
                                     Spacer()
-                                    Button("開く") { NSWorkspace.shared.open(pdf) }
-                                    Button("音声化へ") {
+                                    Button(model.t("開く", "Open")) { NSWorkspace.shared.open(pdf) }
+                                    Button(model.t("音声変換へ", "Convert to Audio")) {
                                         model.ebookURL = pdf
                                         destination = .audioLab
                                     }
+                                    Button {
+                                        model.hideRecentPDF(pdf)
+                                    } label: {
+                                        Label(model.t("履歴から削除", "Remove from History"), systemImage: "xmark.circle")
+                                            .labelStyle(.iconOnly)
+                                    }
+                                    .help(model.t("履歴から削除（PDFは残す）", "Remove from history without deleting the PDF"))
+                                    .accessibilityLabel(model.t("\(pdf.lastPathComponent)を履歴から削除", "Remove \(pdf.lastPathComponent) from history"))
                                 }
                                 .padding(.vertical, 6)
-                                if idx < min(4, model.desktopPDFs.count - 1) {
-                                    Divider()
-                                }
+                                if idx < recent.count - 1 { Divider() }
                             }
                         }
                     }
+                } label: {
+                    HStack {
+                        Text(model.t("最近のPDF", "Recent PDFs"))
+                        Spacer()
+                        Button(model.t("履歴を消去", "Clear History")) { confirmClearRecentPDFs = true }
+                            .disabled(model.recentPDFs.isEmpty)
+                    }
+                }
+                .confirmationDialog(
+                    model.t("最近のPDF履歴を消去しますか？", "Clear recent PDF history?"),
+                    isPresented: $confirmClearRecentPDFs,
+                    titleVisibility: .visible
+                ) {
+                    Button(model.t("履歴を消去", "Clear History"), role: .destructive) { model.clearRecentPDFs() }
+                    Button(model.t("キャンセル", "Cancel"), role: .cancel) {}
+                } message: {
+                    Text(model.t("元のPDFファイルは残ります。", "The original PDF files will remain."))
                 }
             }
             .padding(28)
@@ -2136,25 +2171,36 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 24) {
                 HStack {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("PDFライブラリ (Desktop)")
+                        Text(model.t("PDFライブラリ", "PDF Library"))
                             .font(.title2.bold())
-                        Text("デスクトップに保存されているPDFを閲覧・音声変換にそのまま送れます。")
+                        Text(model.t("選択したフォルダーのPDFを開いたり、音声変換に送ったりできます。", "Open PDFs in the selected folder or send them to Audio Lab."))
                             .foregroundStyle(.secondary)
+                        Label(model.libraryFolder.path, systemImage: "folder")
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .help(model.libraryFolder.path)
                     }
                     Spacer()
-                    Button("再読み込み", systemImage: "arrow.clockwise") {
-                        model.refreshDesktopPDFs()
+                    Button(model.t("フォルダーを選択", "Choose Folder"), systemImage: "folder") {
+                        model.chooseLibraryFolder()
+                    }
+                    Button(model.t("再読み込み", "Reload"), systemImage: "arrow.clockwise") {
+                        model.refreshLibraryPDFs()
                     }
                 }
 
-                GroupBox("PDF一覧 (\(model.desktopPDFs.count)件)") {
-                    if model.desktopPDFs.isEmpty {
-                        Text("DesktopにPDFが見つかりませんでした。")
+                GroupBox(model.t("PDF一覧 (\(model.libraryPDFs.count)件)", "PDFs (\(model.libraryPDFs.count))")) {
+                    if let error = model.libraryError {
+                        Text(model.t("フォルダーを読み込めませんでした。\(error)", "Could not read the folder. \(error)"))
+                            .foregroundStyle(.secondary)
+                            .padding(12)
+                    } else if model.libraryPDFs.isEmpty {
+                        Text(model.t("選択したフォルダーにPDFがありません。", "The selected folder contains no PDFs."))
                             .foregroundStyle(.secondary)
                             .padding(12)
                     } else {
                         VStack(spacing: 0) {
-                            ForEach(Array(model.desktopPDFs.enumerated()), id: \.element) { idx, pdf in
+                            ForEach(Array(model.libraryPDFs.enumerated()), id: \.element) { idx, pdf in
                                 HStack(spacing: 10) {
                                     Label(pdf.lastPathComponent, systemImage: "doc.fill")
                                         .lineLimit(1)
@@ -2171,7 +2217,7 @@ struct ContentView: View {
                                     .buttonStyle(.borderedProminent)
                                 }
                                 .padding(.vertical, 8)
-                                if idx < model.desktopPDFs.count - 1 {
+                                if idx < model.libraryPDFs.count - 1 {
                                     Divider()
                                 }
                             }
@@ -2382,6 +2428,11 @@ struct ContentView: View {
                     model.downloadModelTarget(model.customModelURLText)
                 }
                 .disabled(model.isRunning || model.customModelURLText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            if let selected = model.availableTTSModels.first(where: { $0.id == model.selectedTTSModelID }) {
+                Text(model.t("エンジン: \(selected.engine) · 言語: \(selected.language)", "Engine: \(selected.engine) · Language: \(selected.language)"))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .padding(10)

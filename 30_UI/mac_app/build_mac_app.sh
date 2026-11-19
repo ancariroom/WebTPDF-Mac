@@ -1,0 +1,75 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+SCRIPT_DIR=${0:a:h}
+PRODUCT_ROOT=${SCRIPT_DIR:h:h}
+BUILD_DIR="$SCRIPT_DIR/.build"
+APP_DIR="$PRODUCT_ROOT/40_Ops/apps/WebTPDF Mac.app"
+CONTENTS_DIR="$APP_DIR/Contents"
+MACOS_DIR="$CONTENTS_DIR/MacOS"
+RESOURCES_DIR="$CONTENTS_DIR/Resources"
+EXECUTABLE="$MACOS_DIR/WebTPDFMac"
+CODESIGN_IDENTITY=${CODESIGN_IDENTITY:-"-"}
+
+mkdir -p "$MACOS_DIR" "$RESOURCES_DIR" "$BUILD_DIR"
+
+cp "$PRODUCT_ROOT/20_Backend/scripts/url_pdf_fetcher.py" "$RESOURCES_DIR/url_pdf_fetcher.py"
+chmod +x "$RESOURCES_DIR/url_pdf_fetcher.py"
+if [[ -f "$SCRIPT_DIR/Resources/AppIcon.icns" ]]; then
+  cp "$SCRIPT_DIR/Resources/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
+fi
+
+swiftc \
+  -O \
+  -parse-as-library \
+  -o "$EXECUTABLE" \
+  "$SCRIPT_DIR/Sources/EbookConverterAudioLab/App.swift" \
+  -framework SwiftUI \
+  -framework AVFoundation \
+  -framework PDFKit \
+  -framework AppKit
+
+cat > "$CONTENTS_DIR/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>WebTPDF Mac</string>
+  <key>CFBundleExecutable</key>
+  <string>WebTPDFMac</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.local.webtpdf.mac</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>WebTPDF Mac</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>13.0</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.productivity</string>
+</dict>
+</plist>
+PLIST
+
+chmod +x "$EXECUTABLE"
+plutil -lint "$CONTENTS_DIR/Info.plist" >/dev/null
+if [[ "$CODESIGN_IDENTITY" == "-" ]]; then
+  codesign --force --deep --sign - "$APP_DIR" >/dev/null
+else
+  codesign --force --deep --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$APP_DIR" >/dev/null
+fi
+
+echo "$APP_DIR"

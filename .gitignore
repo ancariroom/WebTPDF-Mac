@@ -1,0 +1,6 @@
+30_UI/**/__pycache__/
+30_UI/**/*.pyc
+30_UI/mac_app/.build/
+40_Ops/apps/
+40_Ops/dist/
+40_Ops/output/

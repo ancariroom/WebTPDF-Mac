@@ -15,6 +15,8 @@ mkdir -p "$MACOS_DIR" "$RESOURCES_DIR" "$BUILD_DIR"
 
 cp "$PRODUCT_ROOT/20_Backend/scripts/url_pdf_fetcher.py" "$RESOURCES_DIR/url_pdf_fetcher.py"
 chmod +x "$RESOURCES_DIR/url_pdf_fetcher.py"
+cp "$PRODUCT_ROOT/20_Backend/scripts/local_audiobook.py" "$RESOURCES_DIR/local_audiobook.py"
+chmod +x "$RESOURCES_DIR/local_audiobook.py"
 if [[ -f "$SCRIPT_DIR/Resources/AppIcon.icns" ]]; then
   cp "$SCRIPT_DIR/Resources/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
 fi

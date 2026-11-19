@@ -16,6 +16,7 @@ struct EbookConverterAudioLabApp: App {
                 .onAppear {
                     appDelegate.model = model
                     model.refreshDockerStatus()
+                    model.refreshTTSModels()
                 }
         }
         .commands {
@@ -67,6 +68,29 @@ final class AppModel: ObservableObject {
         }
     }
 
+    enum AudioEngineMode: String, CaseIterable, Identifiable {
+        case local
+        case docker
+
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .local: return "Macローカル (Docker不要)"
+            case .docker: return "Docker (ebook2audiobook)"
+            }
+        }
+    }
+
+    struct TTSModelItem: Identifiable, Decodable, Hashable {
+        let id: String
+        let name: String
+        let engine: String
+        let voice: String
+        let language: String
+        let installed: Bool
+    }
+
     enum Device: String, CaseIterable, Identifiable {
         case automatic = ""
         case cpu = "CPU"
@@ -93,6 +117,13 @@ final class AppModel: ObservableObject {
     @Published var ebookURL: URL?
     @Published var sourceURLText = ""
     @Published var pageTurnDirection: PageTurnDirection = .right
+    @Published var audioEngineMode: AudioEngineMode = .local
+    @Published var availableTTSModels: [TTSModelItem] = [
+        TTSModelItem(id: "macos:Kyoko", name: "macOS標準: Kyoko (日本語・女性)", engine: "say", voice: "Kyoko", language: "jpn", installed: true),
+        TTSModelItem(id: "edge:ja-JP-NanamiNeural", name: "Neural: Nanami (日本語・女性・高音質)", engine: "edge", voice: "ja-JP-NanamiNeural", language: "jpn", installed: false),
+    ]
+    @Published var selectedTTSModelID = "macos:Kyoko"
+    @Published var customModelURLText = ""
     @Published var voiceURL: URL?
     @Published var customModelURL: URL?
     @Published var language = "jpn"
@@ -339,7 +370,193 @@ final class AppModel: ObservableObject {
             return
         }
 
+        if audioEngineMode == .local {
+            startLocalAudiobookJob(ebookURL: ebookURL)
+            return
+        }
+
         startJobWithResolvedEbook(ebookURL)
+    }
+
+    func refreshTTSModels() {
+        guard let pythonCommand = resolvePythonCommand(),
+              let scriptURL = resolveLocalAudiobookScript()
+        else {
+            return
+        }
+
+        Task.detached { [weak self] in
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: pythonCommand)
+            proc.arguments = [scriptURL.path, "--list-models"]
+            let pipe = Pipe()
+            proc.standardOutput = pipe
+            proc.standardError = Pipe()
+            do {
+                try proc.run()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                proc.waitUntilExit()
+                guard proc.terminationStatus == 0 else { return }
+                let decoded = try JSONDecoder().decode([TTSModelItem].self, from: data)
+                await MainActor.run {
+                    guard let self else { return }
+                    self.availableTTSModels = decoded
+                    if !decoded.contains(where: { $0.id == self.selectedTTSModelID }),
+                       let first = decoded.first {
+                        self.selectedTTSModelID = first.id
+                    }
+                }
+            } catch {
+                return
+            }
+        }
+    }
+
+    func downloadModelTarget(_ target: String) {
+        let trimmed = target.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            statusMessage = "ダウンロードするモデルまたはURLを指定してください。"
+            return
+        }
+        guard let pythonCommand = resolvePythonCommand(),
+              let scriptURL = resolveLocalAudiobookScript()
+        else {
+            fail("python3 または local_audiobook.py が見つかりませんでした。")
+            return
+        }
+
+        cancelRequested = false
+        runState = .running
+        statusMessage = "音声モデルをダウンロード中..."
+        progressFraction = nil
+        progressText = "DL中"
+        remainingText = "-"
+        logText = "Downloading TTS model: \(trimmed)\n"
+        startProgressClock()
+
+        runPythonSubprocess(
+            pythonCommand: pythonCommand,
+            arguments: [scriptURL.path, "--download-model", trimmed],
+            workingDirectory: applicationSupportRoot
+        ) { [weak self] exitCode in
+            guard let self else { return }
+            self.stopProgressClock()
+            if exitCode == 0 {
+                self.runState = .completed
+                self.statusMessage = "モデルダウンロード完了"
+                self.progressText = "100%"
+                self.remainingText = "00:00"
+                self.refreshTTSModels()
+            } else {
+                self.fail("モデルダウンロードに失敗しました (exit \(exitCode))。")
+            }
+        }
+    }
+
+    private func startLocalAudiobookJob(ebookURL: URL) {
+        guard let pythonCommand = resolvePythonCommand(),
+              let scriptURL = resolveLocalAudiobookScript()
+        else {
+            fail("python3 または local_audiobook.py が見つかりませんでした。")
+            return
+        }
+
+        let jobID = makeJobID()
+        let outputDirectory = outputRoot.appendingPathComponent(jobID, isDirectory: true)
+        do {
+            try prepareRuntimeDirectories(outputDirectory: outputDirectory)
+        } catch {
+            fail("Failed to prepare runtime directories: \(error.localizedDescription)")
+            return
+        }
+
+        activeOutputDirectory = outputDirectory
+        activeDryRun = dryRun
+        cancelRequested = false
+        artifactURL = nil
+        self.outputDirectory = outputDirectory
+        player = nil
+        isPlaying = false
+
+        let conversionEbookURL: URL
+        do {
+            conversionEbookURL = try prepareEbookForConversion(ebookURL: ebookURL, outputDirectory: outputDirectory)
+        } catch {
+            fail(error.localizedDescription)
+            return
+        }
+
+        let arguments = [
+            scriptURL.path,
+            "--ebook", conversionEbookURL.path,
+            "--output-dir", outputDirectory.path,
+            "--language", language.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "jpn" : language.trimmingCharacters(in: .whitespacesAndNewlines),
+            "--output-format", outputFormat.rawValue,
+            "--model", selectedTTSModelID,
+        ]
+
+        logText = "$ \(shellJoined([pythonCommand] + arguments))\n\n"
+        runState = .running
+        statusMessage = "ローカル音声変換中 (Docker不要)..."
+        startProgressClock()
+
+        if dryRun {
+            finishJob(exitCode: 0)
+            return
+        }
+
+        runPythonSubprocess(
+            pythonCommand: pythonCommand,
+            arguments: arguments,
+            workingDirectory: applicationSupportRoot
+        ) { [weak self] exitCode in
+            self?.finishJob(exitCode: exitCode)
+        }
+    }
+
+    private func runPythonSubprocess(
+        pythonCommand: String,
+        arguments: [String],
+        workingDirectory: URL,
+        onFinish: @escaping @MainActor (Int32) -> Void
+    ) {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: pythonCommand)
+        proc.arguments = arguments
+        proc.currentDirectoryURL = workingDirectory
+
+        var environment = ProcessInfo.processInfo.environment
+        environment["PATH"] = appPath()
+        environment["PYTHONUNBUFFERED"] = "1"
+        proc.environment = environment
+
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else {
+                return
+            }
+            Task { @MainActor in
+                self?.appendLog(chunk)
+            }
+        }
+
+        proc.terminationHandler = { [weak self] terminated in
+            pipe.fileHandleForReading.readabilityHandler = nil
+            Task { @MainActor in
+                self?.process = nil
+                onFinish(terminated.terminationStatus)
+            }
+        }
+
+        do {
+            try proc.run()
+            self.process = proc
+        } catch {
+            fail("プロセスの起動に失敗しました: \(error.localizedDescription)")
+        }
     }
 
     private func startJobWithResolvedEbook(_ ebookURL: URL) {
@@ -694,6 +911,14 @@ final class AppModel: ObservableObject {
 
     private func resolveURLFetcherScript() -> URL? {
         if let resourceURL = Bundle.main.resourceURL?.appendingPathComponent("url_pdf_fetcher.py"),
+           FileManager.default.isExecutableFile(atPath: resourceURL.path) || FileManager.default.fileExists(atPath: resourceURL.path) {
+            return resourceURL
+        }
+        return nil
+    }
+
+    private func resolveLocalAudiobookScript() -> URL? {
+        if let resourceURL = Bundle.main.resourceURL?.appendingPathComponent("local_audiobook.py"),
            FileManager.default.isExecutableFile(atPath: resourceURL.path) || FileManager.default.fileExists(atPath: resourceURL.path) {
             return resourceURL
         }
@@ -1201,7 +1426,7 @@ struct ContentView: View {
                     )
                     .font(.callout)
                     .lineLimit(1)
-                    Text(model.dockerStatus)
+                    Text(model.audioEngineMode == .local ? "MacローカルTTS Ready (Docker不要)" : model.dockerStatus)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -1483,6 +1708,13 @@ struct ContentView: View {
     private var inputGroup: some View {
         GroupBox("入力") {
             VStack(spacing: 12) {
+                Picker("実行エンジン", selection: $model.audioEngineMode) {
+                    ForEach(AppModel.AudioEngineMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+
                 FilePickerRow(
                     title: "電子書籍ファイル",
                     url: model.ebookURL,
@@ -1493,31 +1725,35 @@ struct ContentView: View {
 
                 languageAndFormatRow
 
-                TextField("TTS エンジン 任意", text: $model.ttsEngine)
+                if model.audioEngineMode == .local {
+                    localModelSection
+                } else {
+                    TextField("TTS エンジン 任意", text: $model.ttsEngine)
 
-                Picker("デバイス", selection: $model.device) {
-                    ForEach(AppModel.Device.allCases) { device in
-                        Text(device.label).tag(device)
+                    Picker("デバイス", selection: $model.device) {
+                        ForEach(AppModel.Device.allCases) { device in
+                            Text(device.label).tag(device)
+                        }
                     }
+
+                    TextField("Docker イメージ", text: $model.dockerImage)
+
+                    FilePickerRow(
+                        title: "音声サンプル",
+                        url: model.voiceURL,
+                        buttonTitle: "選択",
+                        action: { model.chooseVoice() },
+                        clearAction: model.voiceURL == nil ? nil : { model.clearVoice() }
+                    )
+
+                    FilePickerRow(
+                        title: "カスタムモデル",
+                        url: model.customModelURL,
+                        buttonTitle: "選択",
+                        action: { model.chooseCustomModel() },
+                        clearAction: model.customModelURL == nil ? nil : { model.clearCustomModel() }
+                    )
                 }
-
-                TextField("Docker イメージ", text: $model.dockerImage)
-
-                FilePickerRow(
-                    title: "音声サンプル",
-                    url: model.voiceURL,
-                    buttonTitle: "選択",
-                    action: { model.chooseVoice() },
-                    clearAction: model.voiceURL == nil ? nil : { model.clearVoice() }
-                )
-
-                FilePickerRow(
-                    title: "カスタムモデル",
-                    url: model.customModelURL,
-                    buttonTitle: "選択",
-                    action: { model.chooseCustomModel() },
-                    clearAction: model.customModelURL == nil ? nil : { model.clearCustomModel() }
-                )
 
                 sampleOptions
 
@@ -1525,6 +1761,37 @@ struct ContentView: View {
             }
             .padding(8)
         }
+    }
+
+    private var localModelSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Picker("音声モデル", selection: $model.selectedTTSModelID) {
+                    ForEach(model.availableTTSModels) { item in
+                        Text(item.installed ? "\(item.name) [済]" : "\(item.name) [未DL]")
+                            .tag(item.id)
+                    }
+                }
+
+                Button("モデルDL") {
+                    model.downloadModelTarget(model.selectedTTSModelID)
+                }
+                .disabled(model.isRunning)
+            }
+
+            HStack(spacing: 8) {
+                TextField("新しいモデルURL (https://... .zip / .onnx 等)", text: $model.customModelURLText)
+                    .textFieldStyle(.roundedBorder)
+
+                Button("URLからモデルDL") {
+                    model.downloadModelTarget(model.customModelURLText)
+                }
+                .disabled(model.isRunning || model.customModelURLText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(10)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
     private var languageAndFormatRow: some View {

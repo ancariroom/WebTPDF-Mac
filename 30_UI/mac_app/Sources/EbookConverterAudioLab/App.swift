@@ -549,7 +549,6 @@ final class AppModel: ObservableObject {
         let sayOk = FileManager.default.isExecutableFile(atPath: "/usr/bin/say")
         let chromeOk = FileManager.default.isExecutableFile(atPath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
         let ollamaPath = resolveOllamaCommand()
-        let dockerOk = dockerReady
 
         runtimeChecks = [
             ("Python 3", pythonPath != nil, pythonPath ?? "未検出"),
@@ -557,8 +556,70 @@ final class AppModel: ObservableObject {
             ("macOS 音声合成 (say)", sayOk, sayOk ? "/usr/bin/say" : "未検出"),
             ("ffmpeg (MP3/M4B変換)", ffmpegPath != nil, ffmpegPath ?? "未検出"),
             ("Ollama (ローカルLLM)", ollamaPath != nil, ollamaStatusMessage),
-            ("Docker (任意)", dockerOk, dockerStatus),
         ]
+    }
+
+    func resolveRepoRoot() -> URL? {
+        // Walk up from .../40_Ops/apps/WebTPDF Mac.app -> repo root
+        let candidateFromBundle = Bundle.main.bundleURL
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        if FileManager.default.fileExists(atPath: candidateFromBundle.appendingPathComponent("30_UI/mac_app/build_mac_app.sh").path) {
+            return candidateFromBundle
+        }
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+        let fallback = URL(fileURLWithPath: home, isDirectory: true)
+            .appendingPathComponent("Git", isDirectory: true)
+            .appendingPathComponent("WebTPDF-Mac", isDirectory: true)
+        if FileManager.default.fileExists(atPath: fallback.appendingPathComponent("30_UI/mac_app/build_mac_app.sh").path) {
+            return fallback
+        }
+        return nil
+    }
+
+    func updateAndRelaunchApp() {
+        guard let repoRoot = resolveRepoRoot() else {
+            fail("WebTPDF-Mac リポジトリが見つかりませんでした。")
+            return
+        }
+
+        cancelRequested = false
+        runState = .running
+        statusMessage = t("アップデート中 (git pull & 再ビルド)...", "Updating (git pull & rebuild)...")
+        progressFraction = nil
+        progressText = t("更新中", "Updating")
+        remainingText = "-"
+        logText = "Updating WebTPDF Mac from \(repoRoot.path)...\n"
+        startProgressClock()
+
+        let script = """
+        set -e
+        cd "\(repoRoot.path)"
+        git pull --ff-only origin main
+        zsh "30_UI/mac_app/build_mac_app.sh"
+        """
+
+        runPythonSubprocess(
+            pythonCommand: "/bin/zsh",
+            arguments: ["-c", script],
+            workingDirectory: repoRoot
+        ) { [weak self] exitCode in
+            guard let self else { return }
+            self.stopProgressClock()
+            if exitCode == 0 {
+                self.runState = .completed
+                self.statusMessage = self.t("アップデート完了・再起動中...", "Update complete. Relaunching...")
+                let appPath = repoRoot.appendingPathComponent("40_Ops/apps/WebTPDF Mac.app").path
+                let relaunch = Process()
+                relaunch.executableURL = URL(fileURLWithPath: "/bin/zsh")
+                relaunch.arguments = ["-c", "sleep 1 && open \"\(appPath)\""]
+                try? relaunch.run()
+                NSApp.terminate(nil)
+            } else {
+                self.fail(self.t("アップデートに失敗しました (exit \(exitCode))。", "Update failed (exit \(exitCode))."))
+            }
+        }
     }
 
     func chooseLibraryFolder() {
@@ -2069,14 +2130,20 @@ struct ContentView: View {
                     }
                 }
 
-                HStack {
-                    Button("再診断", systemImage: "arrow.clockwise") {
-                        model.refreshDockerStatus()
+                HStack(spacing: 10) {
+                    Button(model.t("再診断", "Re-check"), systemImage: "arrow.clockwise") {
                         model.refreshOllamaModels()
                         model.refreshRuntimeChecks()
                     }
+
+                    Button(model.t("アプリをアップデート", "Update App"), systemImage: "arrow.down.circle") {
+                        model.updateAndRelaunchApp()
+                    }
                     .buttonStyle(.borderedProminent)
+                    .disabled(model.isRunning)
                 }
+
+                logBox(minHeight: 160)
             }
             .padding(28)
         }

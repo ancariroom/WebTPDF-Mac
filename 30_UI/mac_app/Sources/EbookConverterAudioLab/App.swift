@@ -168,6 +168,12 @@ final class AppModel: ObservableObject {
     @Published private(set) var isTestingOllama = false
     @Published private(set) var ollamaTestOutput = ""
     @Published var maxPagesSetting = "1000"
+    @Published var customPDFSaveDirectory: URL? = {
+        if let saved = UserDefaults.standard.string(forKey: "pdfSaveDirectory"), !saved.isEmpty {
+            return URL(fileURLWithPath: saved, isDirectory: true)
+        }
+        return nil
+    }()
     @Published private(set) var runtimeChecks: [(name: String, ok: Bool, detail: String)] = []
     @Published private(set) var libraryPDFs: [URL] = []
     @Published private(set) var libraryFolder = PDFLibraryPreferences().folder
@@ -239,12 +245,36 @@ final class AppModel: ObservableObject {
             .appendingPathComponent("ebook2audiobook", isDirectory: true)
     }
 
-    private var fetchedPDFRoot: URL {
+    var fetchedPDFRoot: URL {
+        if let customPDFSaveDirectory {
+            return customPDFSaveDirectory
+        }
         if let desktopURL = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first {
             return desktopURL
         }
         return URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
             .appendingPathComponent("Desktop", isDirectory: true)
+    }
+
+    func choosePDFSaveDirectory() {
+        let panel = NSOpenPanel()
+        panel.title = t("PDFの保存先フォルダを選択", "Choose PDF Save Folder")
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = fetchedPDFRoot
+
+        guard panel.runModal() == .OK, let chosen = panel.url else {
+            return
+        }
+        customPDFSaveDirectory = chosen
+        UserDefaults.standard.set(chosen.path, forKey: "pdfSaveDirectory")
+    }
+
+    func resetPDFSaveDirectory() {
+        customPDFSaveDirectory = nil
+        UserDefaults.standard.removeObject(forKey: "pdfSaveDirectory")
     }
 
     func t(_ ja: String, _ en: String) -> String {
@@ -1809,7 +1839,7 @@ struct ContentView: View {
                         }
                     }
                     .labelsHidden()
-                    .pickerStyle(.segmented)
+                    .pickerStyle(.menu)
                     .accessibilityLabel(model.t("言語", "Language"))
                     Button {
                         model.launchLoginBrowser()
@@ -1859,7 +1889,7 @@ struct ContentView: View {
                     Image(systemName: "chevron.right").foregroundStyle(.secondary)
                     topologyCard(model.t("ページ送り", "Pagination"), symbol: model.pageTurnDirection == .left ? "arrow.left.square" : "arrow.right.square", detail: model.pageTurnDirection.label)
                     Image(systemName: "chevron.right").foregroundStyle(.secondary)
-                    topologyCard(model.t("Desktop保存", "Save to Desktop"), symbol: "doc.richtext", detail: model.fetchedPDFURL?.lastPathComponent ?? model.t("待機中", "Waiting"))
+                    topologyCard(model.t("保存先", "Save To"), symbol: "folder", detail: model.fetchedPDFURL?.lastPathComponent ?? model.fetchedPDFRoot.lastPathComponent)
                 }
                 .padding(20)
                 .frame(maxWidth: .infinity)
@@ -1873,6 +1903,25 @@ struct ContentView: View {
                                 .foregroundStyle(.secondary)
                             TextField("https://... (PDF / URL)", text: $model.sourceURLText)
                                 .textFieldStyle(.roundedBorder)
+                        }
+
+                        HStack(spacing: 8) {
+                            Text(model.t("保存先フォルダ", "Save Folder"))
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                            Text(model.fetchedPDFRoot.path)
+                                .font(.caption)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            Button(model.t("変更", "Choose")) {
+                                model.choosePDFSaveDirectory()
+                            }
+                            if model.customPDFSaveDirectory != nil {
+                                Button(model.t("Desktopに戻す", "Reset")) {
+                                    model.resetPDFSaveDirectory()
+                                }
+                            }
                         }
 
                         HStack(spacing: 12) {
@@ -1891,7 +1940,7 @@ struct ContentView: View {
                         }
 
                         HStack(spacing: 10) {
-                            Button(model.t("URLからPDF作成（Desktop保存）", "Create PDF to Desktop")) {
+                            Button(model.t("URLからPDF作成", "Create PDF")) {
                                 model.fetchPDFfromURL()
                             }
                             .buttonStyle(.borderedProminent)
@@ -1930,7 +1979,7 @@ struct ContentView: View {
                     }
                     if model.fetchedPDFURL != nil {
                         HStack {
-                            Button(model.t("DesktopのPDFを開く", "Open Desktop PDF")) {
+                            Button(model.t("保存したPDFを開く", "Open Saved PDF")) {
                                 model.openFetchedPDF()
                             }
                             .buttonStyle(.bordered)

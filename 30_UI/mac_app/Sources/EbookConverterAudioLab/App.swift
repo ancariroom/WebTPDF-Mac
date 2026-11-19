@@ -99,6 +99,22 @@ final class AppModel: ObservableObject {
         }
     }
 
+    struct PDFQueueItem: Identifiable, Hashable {
+        enum Status: String {
+            case pending
+            case running
+            case completed
+            case failed
+        }
+
+        let id = UUID()
+        var url: String
+        var direction: PageTurnDirection
+        var status: Status = .pending
+        var outputURL: URL?
+        var errorMessage: String?
+    }
+
     struct TTSModelItem: Identifiable, Decodable, Hashable {
         let id: String
         let name: String
@@ -153,6 +169,8 @@ final class AppModel: ObservableObject {
     @Published var ebookURL: URL?
     @Published var sourceURLText = ""
     @Published var pageTurnDirection: PageTurnDirection = .right
+    @Published var pdfQueue: [PDFQueueItem] = []
+    @Published private(set) var isRunningQueue = false
     @Published var audioEngineMode: AudioEngineMode = .local
     @Published var availableTTSModels: [TTSModelItem] = [
         TTSModelItem(id: "macos:Kyoko", name: "macOS標準: Kyoko (日本語・女性)", engine: "say", voice: "Kyoko", language: "jpn", installed: true),
@@ -294,7 +312,15 @@ final class AppModel: ObservableObject {
     }
 
     var isRunning: Bool {
-        process != nil || preflightTask != nil || fetchProcess != nil || isFetchingURL
+        process != nil || preflightTask != nil || fetchProcess != nil || isFetchingURL || isRunningQueue
+    }
+
+    var canEnqueueURL: Bool {
+        !trimmedSourceURL.isEmpty
+    }
+
+    var hasPendingQueueItems: Bool {
+        pdfQueue.contains(where: { $0.status == .pending })
     }
 
     func chooseEbook() {
@@ -395,6 +421,95 @@ final class AppModel: ObservableObject {
             } else {
                 dockerReady = false
                 dockerStatus = "Docker is installed but not ready"
+            }
+        }
+    }
+
+    func enqueueCurrentURL() {
+        let urlString = trimmedSourceURL
+        guard !urlString.isEmpty else { return }
+        guard let parsed = URL(string: urlString),
+              let scheme = parsed.scheme?.lowercased(),
+              (scheme == "http" || scheme == "https"),
+              parsed.host != nil
+        else {
+            statusMessage = t("有効な http:// または https:// のURLを入力してください。", "Enter a valid http:// or https:// URL.")
+            return
+        }
+
+        pdfQueue.append(PDFQueueItem(url: urlString, direction: pageTurnDirection))
+        sourceURLText = ""
+        statusMessage = t("キューに追加しました (\(pdfQueue.count)件)", "Added to queue (\(pdfQueue.count))")
+    }
+
+    func removeQueueItem(_ id: UUID) {
+        pdfQueue.removeAll { $0.id == id && $0.status != .running }
+    }
+
+    func clearFinishedQueueItems() {
+        pdfQueue.removeAll { $0.status == .completed || $0.status == .failed }
+    }
+
+    func startQueue() {
+        guard hasPendingQueueItems, !isRunning else { return }
+
+        cancelRequested = false
+        isRunningQueue = true
+        runState = .running
+        progressFraction = nil
+        progressText = t("連続処理中", "Queueing")
+        remainingText = "-"
+        logText = "Starting PDF queue (\(pdfQueue.filter { $0.status == .pending }.count) pending item(s))...\n"
+        startProgressClock()
+
+        preflightTask = Task { [weak self] in
+            guard let self else { return }
+            var processedCount = 0
+
+            while !self.cancelRequested,
+                  let nextIndex = self.pdfQueue.firstIndex(where: { $0.status == .pending }) {
+                processedCount += 1
+                let item = self.pdfQueue[nextIndex]
+                self.pdfQueue[nextIndex].status = .running
+                self.pdfQueue[nextIndex].errorMessage = nil
+                self.statusMessage = self.t("キュー実行中 (\(processedCount)): \(item.url)", "Queue (\(processedCount)): \(item.url)")
+                self.appendLog("\n[Queue #\(processedCount)] (\(item.direction.label)) \(item.url)\n")
+
+                do {
+                    let mergedURL = try await self.performURLFetch(urlString: item.url, direction: item.direction)
+                    if self.cancelRequested {
+                        self.pdfQueue[nextIndex].status = .pending
+                        break
+                    }
+                    self.pdfQueue[nextIndex].status = .completed
+                    self.pdfQueue[nextIndex].outputURL = mergedURL
+                    self.ebookURL = mergedURL
+                    self.fetchedPDFURL = mergedURL
+                    self.fetchedFromSourceURL = item.url
+                    self.outputDirectory = mergedURL.deletingLastPathComponent()
+                    self.appendLog("[Queue #\(processedCount)] Saved -> \(mergedURL.path)\n")
+                } catch {
+                    if self.cancelRequested {
+                        self.pdfQueue[nextIndex].status = .pending
+                        break
+                    }
+                    self.pdfQueue[nextIndex].status = .failed
+                    self.pdfQueue[nextIndex].errorMessage = error.localizedDescription
+                    self.appendLog("[Queue #\(processedCount)] Failed: \(error.localizedDescription)\n")
+                }
+            }
+
+            self.preflightTask = nil
+            self.isRunningQueue = false
+            self.stopProgressClock()
+            if self.cancelRequested {
+                self.runState = .idle
+                self.statusMessage = "Canceled"
+            } else {
+                self.runState = .completed
+                self.statusMessage = self.t("キュー実行完了 (\(processedCount)件処理)", "Queue completed (\(processedCount) item(s))")
+                self.progressText = "100%"
+                self.remainingText = "00:00"
             }
         }
     }
@@ -1037,6 +1152,7 @@ final class AppModel: ObservableObject {
         preflightTask?.cancel()
         preflightTask = nil
         isFetchingURL = false
+        isRunningQueue = false
         if let fetchProcess, fetchProcess.isRunning {
             fetchProcess.terminate()
         }
@@ -1257,7 +1373,7 @@ final class AppModel: ObservableObject {
         return nil
     }
 
-    private func performURLFetch(urlString: String) async throws -> URL {
+    private func performURLFetch(urlString: String, direction: PageTurnDirection? = nil) async throws -> URL {
         guard let parsed = URL(string: urlString),
               let scheme = parsed.scheme?.lowercased(),
               scheme == "http" || scheme == "https",
@@ -1285,12 +1401,13 @@ final class AppModel: ObservableObject {
         return try await withCheckedThrowingContinuation { continuation in
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: pythonCommand)
+            let resolvedDirection = direction ?? pageTurnDirection
             let maxPages = Int(maxPagesSetting.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 1000
             proc.arguments = [
                 scriptURL.path,
                 "--url", urlString,
                 "--output", outputURL.path,
-                "--direction", pageTurnDirection.rawValue,
+                "--direction", resolvedDirection.rawValue,
                 "--max-pages", String(max(1, maxPages)),
             ]
             proc.currentDirectoryURL = fetchedPDFRoot
@@ -1946,6 +2063,11 @@ struct ContentView: View {
                             .buttonStyle(.borderedProminent)
                             .disabled(!model.canFetchURL)
 
+                            Button(model.t("＋ キューに追加", "+ Add to Queue")) {
+                                model.enqueueCurrentURL()
+                            }
+                            .disabled(!model.canEnqueueURL)
+
                             Button(model.t("ログイン用ブラウザを開く", "Open Login Browser")) {
                                 model.launchLoginBrowser()
                             }
@@ -1964,6 +2086,8 @@ struct ContentView: View {
                     }
                     .padding(8)
                 }
+
+                queueSection
 
                 GroupBox(model.t("準備状況・保存結果", "Status & Result")) {
                     VStack(spacing: 0) {
@@ -1992,6 +2116,94 @@ struct ContentView: View {
                 logBox(minHeight: 180)
             }
             .padding(28)
+        }
+    }
+
+    private var queueSection: some View {
+        GroupBox(model.t("実行キュー (\(model.pdfQueue.count)件)", "Execution Queue (\(model.pdfQueue.count))")) {
+            VStack(alignment: .leading, spacing: 10) {
+                if model.pdfQueue.isEmpty {
+                    Text(model.t("URLとページ送り方向（← / →）を選んで「＋ キューに追加」を押すと、順番に自動でPDF化できます。", "Choose a URL and arrow direction (← / →), then click '+ Add to Queue' to process them sequentially."))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.vertical, 4)
+                } else {
+                    ForEach($model.pdfQueue) { $item in
+                        HStack(spacing: 10) {
+                            Image(systemName: queueStatusSymbol(item.status))
+                                .foregroundStyle(queueStatusColor(item.status))
+
+                            Text(item.url)
+                                .font(.caption)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+
+                            Picker("", selection: $item.direction) {
+                                ForEach(AppModel.PageTurnDirection.allCases) { dir in
+                                    Text(dir.label).tag(dir)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                            .frame(width: 150)
+                            .disabled(item.status == .running)
+
+                            if let out = item.outputURL {
+                                Button(model.t("開く", "Open")) {
+                                    NSWorkspace.shared.open(out)
+                                }
+                            }
+
+                            Button {
+                                model.removeQueueItem(item.id)
+                            } label: {
+                                Image(systemName: "trash")
+                            }
+                            .buttonStyle(.borderless)
+                            .disabled(item.status == .running)
+                        }
+                        if item.id != model.pdfQueue.last?.id {
+                            Divider()
+                        }
+                    }
+
+                    HStack(spacing: 10) {
+                        Button(model.t("キューを連続実行", "Run Queue")) {
+                            model.startQueue()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!model.hasPendingQueueItems || model.isRunning)
+
+                        Button(model.t("完了済みを整理", "Clear Finished")) {
+                            model.clearFinishedQueueItems()
+                        }
+                        .disabled(model.isRunning)
+
+                        Spacer()
+                    }
+                    .padding(.top, 4)
+                }
+            }
+            .padding(8)
+        }
+    }
+
+    private func queueStatusSymbol(_ status: AppModel.PDFQueueItem.Status) -> String {
+        switch status {
+        case .pending: return "clock"
+        case .running: return "record.circle"
+        case .completed: return "checkmark.circle.fill"
+        case .failed: return "exclamationmark.triangle.fill"
+        }
+    }
+
+    private func queueStatusColor(_ status: AppModel.PDFQueueItem.Status) -> Color {
+        switch status {
+        case .pending: return .secondary
+        case .running: return .accentColor
+        case .completed: return .green
+        case .failed: return .orange
         }
     }
 

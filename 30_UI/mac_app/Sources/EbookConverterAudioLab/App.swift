@@ -500,6 +500,7 @@ final class AppModel: ObservableObject {
                 self.ollamaStatusMessage = "Ollama が起動していません（Ollama.app 起動後に再読み込み）"
             }
             self.isRefreshingOllama = false
+            self.refreshRuntimeChecks()
         }
     }
 
@@ -1762,7 +1763,11 @@ struct ContentView: View {
                     )
                     .font(.callout)
                     .lineLimit(1)
-                    Text(model.audioEngineMode == .local ? model.t("MacローカルTTS Ready", "Local Mac TTS Ready") : model.dockerStatus)
+                    Text(
+                        model.audioEngineMode == .local
+                            ? "TTS: Ready · LLM: \(model.ollamaStatusMessage)"
+                            : model.dockerStatus
+                    )
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -2273,11 +2278,11 @@ struct ContentView: View {
                                         .lineLimit(1)
                                         .truncationMode(.middle)
                                     Spacer()
-                                    Button("開く") { NSWorkspace.shared.open(pdf) }
+                                    Button(model.t("開く", "Open")) { NSWorkspace.shared.open(pdf) }
                                     Button("Finder") {
                                         NSWorkspace.shared.activateFileViewerSelecting([pdf])
                                     }
-                                    Button("音声変換へ") {
+                                    Button(model.t("音声変換へ", "Convert to Audio")) {
                                         model.ebookURL = pdf
                                         destination = .audioLab
                                     }
@@ -2302,45 +2307,17 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("システム設定")
                         .font(.title2.bold())
-                    Text("ページ送りやPDF保存・音声変換の既定値を設定します。")
+                    Text(model.t("PDF取得時のページ送り上限を設定します。", "Set the maximum number of page turns for PDF capture."))
                         .foregroundStyle(.secondary)
                 }
 
-                GroupBox("PDF取得設定") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack {
-                            Text("既定のページ送り方向")
-                            Spacer()
-                            Picker("ページ送り方向", selection: $model.pageTurnDirection) {
-                                ForEach(AppModel.PageTurnDirection.allCases) { dir in
-                                    Text(dir.label).tag(dir)
-                                }
-                            }
-                            .pickerStyle(.segmented)
-                            .labelsHidden()
-                            .frame(maxWidth: 220)
-                        }
-                        Divider()
-                        HStack {
-                            Text("最大ページ送り数")
-                            Spacer()
-                            TextField("1000", text: $model.maxPagesSetting)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(width: 100)
-                        }
-                    }
-                    .padding(8)
-                }
-
-                GroupBox("音声変換の既定値") {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Picker("実行エンジン", selection: $model.audioEngineMode) {
-                            ForEach(AppModel.AudioEngineMode.allCases) { mode in
-                                Text(mode.label).tag(mode)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                        languageAndFormatRow
+                GroupBox(model.t("PDF取得設定", "PDF Capture Settings")) {
+                    HStack {
+                        Text(model.t("最大ページ送り数", "Maximum Page Turns"))
+                        Spacer()
+                        TextField("1000", text: $model.maxPagesSetting)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 100)
                     }
                     .padding(8)
                 }

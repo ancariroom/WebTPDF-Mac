@@ -459,12 +459,7 @@ final class AppModel: ObservableObject {
             return
         }
 
-        if audioEngineMode == .local {
-            startLocalAudiobookJob(ebookURL: ebookURL)
-            return
-        }
-
-        startJobWithResolvedEbook(ebookURL)
+        startLocalAudiobookJob(ebookURL: ebookURL)
     }
 
     func refreshTTSModels() {
@@ -1793,11 +1788,7 @@ struct ContentView: View {
                     )
                     .font(.callout)
                     .lineLimit(1)
-                    Text(
-                        model.audioEngineMode == .local
-                            ? "TTS: Ready · LLM: \(model.ollamaStatusMessage)"
-                            : model.dockerStatus
-                    )
+                    Text("TTS: Ready · LLM: \(model.ollamaStatusMessage)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -2449,54 +2440,19 @@ struct ContentView: View {
     }
 
     private var inputGroup: some View {
-        GroupBox("入力") {
+        GroupBox(model.t("入力", "Input")) {
             VStack(spacing: 12) {
-                Picker("実行エンジン", selection: $model.audioEngineMode) {
-                    ForEach(AppModel.AudioEngineMode.allCases) { mode in
-                        Text(mode.label).tag(mode)
-                    }
-                }
-                .pickerStyle(.segmented)
-
                 FilePickerRow(
-                    title: "電子書籍ファイル",
+                    title: model.t("電子書籍ファイル", "Ebook File"),
                     url: model.ebookURL,
-                    buttonTitle: "選択",
+                    buttonTitle: model.t("選択", "Choose"),
                     action: { model.chooseEbook() },
                     clearAction: model.ebookURL == nil ? nil : { model.clearEbook() }
                 )
 
                 languageAndFormatRow
 
-                if model.audioEngineMode == .local {
-                    localModelSection
-                } else {
-                    TextField("TTS エンジン 任意", text: $model.ttsEngine)
-
-                    Picker("デバイス", selection: $model.device) {
-                        ForEach(AppModel.Device.allCases) { device in
-                            Text(device.label).tag(device)
-                        }
-                    }
-
-                    TextField("Docker イメージ", text: $model.dockerImage)
-
-                    FilePickerRow(
-                        title: "音声サンプル",
-                        url: model.voiceURL,
-                        buttonTitle: "選択",
-                        action: { model.chooseVoice() },
-                        clearAction: model.voiceURL == nil ? nil : { model.clearVoice() }
-                    )
-
-                    FilePickerRow(
-                        title: "カスタムモデル",
-                        url: model.customModelURL,
-                        buttonTitle: "選択",
-                        action: { model.chooseCustomModel() },
-                        clearAction: model.customModelURL == nil ? nil : { model.clearCustomModel() }
-                    )
-                }
+                localModelSection
 
                 sampleOptions
 

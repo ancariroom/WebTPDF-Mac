@@ -1837,7 +1837,7 @@ struct ContentView: View {
                             }
                         }
                     } label: {
-                        Label(model.uiLanguage.label, systemImage: "globe")
+                        Text(model.uiLanguage.label)
                     }
                     .menuStyle(.borderlessButton)
                     .accessibilityLabel(model.t("言語", "Language"))

@@ -1833,13 +1833,22 @@ struct ContentView: View {
                         ProgressView()
                             .controlSize(.small)
                     }
-                    Picker(model.t("言語", "Language"), selection: $model.uiLanguage) {
+                    Menu {
                         ForEach(AppModel.UILanguage.allCases) { lang in
-                            Text(lang.label).tag(lang)
+                            Button {
+                                model.uiLanguage = lang
+                            } label: {
+                                if model.uiLanguage == lang {
+                                    Label(lang.label, systemImage: "checkmark")
+                                } else {
+                                    Text(lang.label)
+                                }
+                            }
                         }
+                    } label: {
+                        Label(model.uiLanguage.label, systemImage: "globe")
                     }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
+                    .menuStyle(.borderlessButton)
                     .accessibilityLabel(model.t("言語", "Language"))
                     Button {
                         model.launchLoginBrowser()

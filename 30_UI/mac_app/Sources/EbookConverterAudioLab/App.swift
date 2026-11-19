@@ -17,6 +17,7 @@ struct EbookConverterAudioLabApp: App {
                     appDelegate.model = model
                     model.refreshDockerStatus()
                     model.refreshTTSModels()
+                    model.refreshOllamaModels()
                 }
         }
         .commands {
@@ -91,6 +92,24 @@ final class AppModel: ObservableObject {
         let installed: Bool
     }
 
+    struct OllamaModelInfo: Identifiable, Decodable, Hashable {
+        struct Details: Decodable, Hashable {
+            let parameter_size: String?
+            let quantization_level: String?
+            let family: String?
+        }
+
+        let name: String
+        let size: Int64?
+        let details: Details?
+
+        var id: String { name }
+    }
+
+    private struct OllamaTagsResponse: Decodable {
+        let models: [OllamaModelInfo]
+    }
+
     enum Device: String, CaseIterable, Identifiable {
         case automatic = ""
         case cpu = "CPU"
@@ -124,6 +143,11 @@ final class AppModel: ObservableObject {
     ]
     @Published var selectedTTSModelID = "macos:Kyoko"
     @Published var customModelURLText = ""
+    @Published var ollamaModels: [OllamaModelInfo] = []
+    @Published var selectedOllamaModelName = ""
+    @Published var ollamaPullName = "gemma3:4b"
+    @Published private(set) var isRefreshingOllama = false
+    @Published private(set) var ollamaStatusMessage = "未確認"
     @Published var voiceURL: URL?
     @Published var customModelURL: URL?
     @Published var language = "jpn"
@@ -385,31 +409,111 @@ final class AppModel: ObservableObject {
             return
         }
 
-        Task.detached { [weak self] in
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: pythonCommand)
-            proc.arguments = [scriptURL.path, "--list-models"]
-            let pipe = Pipe()
-            proc.standardOutput = pipe
-            proc.standardError = Pipe()
-            do {
-                try proc.run()
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                proc.waitUntilExit()
-                guard proc.terminationStatus == 0 else { return }
-                let decoded = try JSONDecoder().decode([TTSModelItem].self, from: data)
-                await MainActor.run {
-                    guard let self else { return }
-                    self.availableTTSModels = decoded
-                    if !decoded.contains(where: { $0.id == self.selectedTTSModelID }),
-                       let first = decoded.first {
-                        self.selectedTTSModelID = first.id
-                    }
+        Task { [weak self] in
+            let decoded: [TTSModelItem]? = await Task.detached {
+                let proc = Process()
+                proc.executableURL = URL(fileURLWithPath: pythonCommand)
+                proc.arguments = [scriptURL.path, "--list-models"]
+                let pipe = Pipe()
+                proc.standardOutput = pipe
+                proc.standardError = Pipe()
+                do {
+                    try proc.run()
+                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                    proc.waitUntilExit()
+                    guard proc.terminationStatus == 0 else { return nil }
+                    return try JSONDecoder().decode([TTSModelItem].self, from: data)
+                } catch {
+                    return nil
                 }
-            } catch {
-                return
+            }.value
+
+            guard let self, let decoded else { return }
+            self.availableTTSModels = decoded
+            if !decoded.contains(where: { $0.id == self.selectedTTSModelID }),
+               let first = decoded.first {
+                self.selectedTTSModelID = first.id
             }
         }
+    }
+
+    func refreshOllamaModels() {
+        isRefreshingOllama = true
+        ollamaStatusMessage = "Ollamaモデル取得中..."
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                guard let url = URL(string: "http://127.0.0.1:11434/api/tags") else { return }
+                var request = URLRequest(url: url)
+                request.timeoutInterval = 3
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                    self.ollamaModels = []
+                    self.ollamaStatusMessage = "Ollama API に接続できません (127.0.0.1:11434)"
+                    self.isRefreshingOllama = false
+                    return
+                }
+                let decoded = try JSONDecoder().decode(OllamaTagsResponse.self, from: data)
+                self.ollamaModels = decoded.models
+                if !decoded.models.contains(where: { $0.name == self.selectedOllamaModelName }) {
+                    self.selectedOllamaModelName = decoded.models.first?.name ?? ""
+                }
+                self.ollamaStatusMessage = decoded.models.isEmpty ? "モデル未インストール" : "\(decoded.models.count)件のモデルを検出"
+            } catch {
+                self.ollamaModels = []
+                self.ollamaStatusMessage = "Ollama が起動していません（Ollama.app 起動後に再読み込み）"
+            }
+            self.isRefreshingOllama = false
+        }
+    }
+
+    func pullOllamaModel(_ name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            statusMessage = "ダウンロードするOllamaモデル名を入力してください。"
+            return
+        }
+        guard let ollamaCommand = resolveOllamaCommand() else {
+            fail("ollama コマンドが見つかりませんでした。Ollama をインストールしてください。")
+            return
+        }
+
+        cancelRequested = false
+        runState = .running
+        statusMessage = "Ollamaモデルをプル中: \(trimmed)"
+        progressFraction = nil
+        progressText = "DL中"
+        remainingText = "-"
+        logText = "$ \(ollamaCommand) pull \(trimmed)\n\n"
+        startProgressClock()
+
+        runPythonSubprocess(
+            pythonCommand: ollamaCommand,
+            arguments: ["pull", trimmed],
+            workingDirectory: applicationSupportRoot
+        ) { [weak self] exitCode in
+            guard let self else { return }
+            self.stopProgressClock()
+            if exitCode == 0 {
+                self.runState = .completed
+                self.statusMessage = "Ollamaモデル取得完了: \(trimmed)"
+                self.progressText = "100%"
+                self.remainingText = "00:00"
+                self.selectedOllamaModelName = trimmed
+                self.refreshOllamaModels()
+            } else {
+                self.fail("Ollamaモデルのダウンロードに失敗しました (exit \(exitCode))。")
+            }
+        }
+    }
+
+    private func resolveOllamaCommand() -> String? {
+        findExecutable([
+            "/usr/local/bin/ollama",
+            "/opt/homebrew/bin/ollama",
+            "/Applications/Ollama.app/Contents/Resources/ollama",
+        ])
     }
 
     func downloadModelTarget(_ target: String) {
@@ -1378,6 +1482,7 @@ struct ContentView: View {
     enum Destination: String, CaseIterable, Identifiable {
         case urlToPDF
         case audioLab
+        case models
         case logs
 
         var id: String { rawValue }
@@ -1386,6 +1491,7 @@ struct ContentView: View {
             switch self {
             case .urlToPDF: return "URL → PDF 作成"
             case .audioLab: return "音声変換 (Audio Lab)"
+            case .models: return "LLM / モデル"
             case .logs: return "環境・実行ログ"
             }
         }
@@ -1394,6 +1500,7 @@ struct ContentView: View {
             switch self {
             case .urlToPDF: return "doc.text.magnifyingglass"
             case .audioLab: return "waveform"
+            case .models: return "brain"
             case .logs: return "terminal"
             }
         }
@@ -1412,6 +1519,8 @@ struct ContentView: View {
                         .tag(Destination.audioLab)
                 }
                 Section("システム") {
+                    Label(Destination.models.title, systemImage: Destination.models.symbol)
+                        .tag(Destination.models)
                     Label(Destination.logs.title, systemImage: Destination.logs.symbol)
                         .tag(Destination.logs)
                 }
@@ -1441,6 +1550,8 @@ struct ContentView: View {
                     urlToPDFView
                 case .audioLab:
                     audioLabView
+                case .models:
+                    modelsView
                 case .logs:
                     systemLogsView
                 }
@@ -1642,6 +1753,100 @@ struct ContentView: View {
                         Spacer()
                     }
                     .padding(.top, 8)
+                }
+
+                logBox(minHeight: 160)
+            }
+            .padding(28)
+        }
+    }
+
+    private var modelsView: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("LLM / 音声モデル管理")
+                        .font(.title2.bold())
+                    Text("ローカル LLM（Ollama）と音声合成モデルの選択・ダウンロードを行います。")
+                        .foregroundStyle(.secondary)
+                }
+
+                GroupBox("ローカル LLM (Ollama)") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Ollama")
+                                    .font(.headline)
+                                Text(model.ollamaStatusMessage)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button("再読み込み", systemImage: "arrow.clockwise") {
+                                model.refreshOllamaModels()
+                            }
+                            .disabled(model.isRefreshingOllama)
+                        }
+
+                        if model.isRefreshingOllama {
+                            ProgressView("読み込み中...").controlSize(.small)
+                        } else if !model.ollamaModels.isEmpty {
+                            Picker("利用モデル", selection: $model.selectedOllamaModelName) {
+                                ForEach(model.ollamaModels) { item in
+                                    Text(item.name).tag(item.name)
+                                }
+                            }
+                            if let selected = model.ollamaModels.first(where: { $0.name == model.selectedOllamaModelName }) {
+                                GroupBox {
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        if let family = selected.details?.family {
+                                            LabeledContent("ファミリー", value: family)
+                                        }
+                                        if let params = selected.details?.parameter_size {
+                                            LabeledContent("パラメータ数", value: params)
+                                        }
+                                        if let quant = selected.details?.quantization_level {
+                                            LabeledContent("量子化", value: quant)
+                                        }
+                                        if let size = selected.size {
+                                            LabeledContent("サイズ", value: ByteCountFormatter.string(fromByteCount: size, countStyle: .file))
+                                        }
+                                    }
+                                    .padding(4)
+                                }
+                            }
+                        }
+
+                        Divider()
+
+                        HStack(spacing: 8) {
+                            TextField("モデル名 (例: gemma3:4b, qwen2.5:7b)", text: $model.ollamaPullName)
+                                .textFieldStyle(.roundedBorder)
+                            Button("ダウンロード (pull)") {
+                                model.pullOllamaModel(model.ollamaPullName)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(model.isRunning || model.ollamaPullName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        }
+                    }
+                    .padding(8)
+                }
+
+                GroupBox("音声合成モデル (TTS / Docker不要)") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        localModelSection
+                        if let selectedTTS = model.availableTTSModels.first(where: { $0.id == model.selectedTTSModelID }) {
+                            GroupBox {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    LabeledContent("エンジン", value: selectedTTS.engine)
+                                    LabeledContent("言語", value: selectedTTS.language)
+                                    LabeledContent("状態", value: selectedTTS.installed ? "インストール済み" : "未ダウンロード")
+                                }
+                                .padding(4)
+                            }
+                        }
+                    }
+                    .padding(8)
                 }
 
                 logBox(minHeight: 160)

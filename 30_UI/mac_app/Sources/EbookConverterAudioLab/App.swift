@@ -93,7 +93,7 @@ final class AppModel: ObservableObject {
 
         var label: String {
             switch self {
-            case .local: return "Macローカル (Docker不要)"
+            case .local: return "Macローカル"
             case .docker: return "Docker (ebook2audiobook)"
             }
         }
@@ -742,7 +742,7 @@ final class AppModel: ObservableObject {
 
         logText = "$ \(shellJoined([pythonCommand] + arguments))\n\n"
         runState = .running
-        statusMessage = "ローカル音声変換中 (Docker不要)..."
+        statusMessage = "ローカル音声変換中..."
         startProgressClock()
 
         if dryRun {
@@ -1701,7 +1701,7 @@ struct ContentView: View {
                     )
                     .font(.callout)
                     .lineLimit(1)
-                    Text(model.audioEngineMode == .local ? model.t("MacローカルTTS Ready (Docker不要)", "Local Mac TTS Ready (No Docker)") : model.dockerStatus)
+                    Text(model.audioEngineMode == .local ? model.t("MacローカルTTS Ready", "Local Mac TTS Ready") : model.dockerStatus)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -1886,7 +1886,7 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(model.t("電子書籍をオーディオブックに変換", "Convert Ebooks to Audiobooks"))
                         .font(.title2.bold())
-                    Text(model.t("ローカルの PDF / EPUB / TXT または取得済みPDFを音声化します（Docker不要のローカルTTSに対応）。", "Convert local or fetched PDF / EPUB / TXT into mp3 or m4b audio (works locally without Docker)."))
+                    Text(model.t("ローカルの PDF / EPUB / TXT または取得済みPDFを音声化します。", "Convert local or fetched PDF / EPUB / TXT into mp3 or m4b audio."))
                         .foregroundStyle(.secondary)
                 }
 

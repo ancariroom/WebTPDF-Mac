@@ -2639,15 +2639,25 @@ struct ContentView: View {
     }
 
     private func logBox(minHeight: CGFloat) -> some View {
-        GroupBox("ログ") {
-            ScrollView(.vertical, showsIndicators: true) {
-                Text(model.logText)
-                    .font(.system(.caption, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(8)
+        GroupBox(model.t("ログ", "Log")) {
+            ScrollViewReader { proxy in
+                ScrollView(.vertical, showsIndicators: true) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text(model.logText)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                        Color.clear
+                            .frame(height: 1)
+                            .id("log-bottom")
+                    }
+                }
+                .frame(height: minHeight)
+                .onChange(of: model.logText) { _, _ in
+                    proxy.scrollTo("log-bottom", anchor: .bottom)
+                }
             }
-            .frame(minHeight: minHeight)
         }
     }
 

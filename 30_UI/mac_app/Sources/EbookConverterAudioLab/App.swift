@@ -495,6 +495,11 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func startQueueIfAutoRunEnabled() {
+        guard !isQueueAutoPaused, hasPendingQueueItems, !isRunning else { return }
+        startQueue()
+    }
+
     func pauseQueueAutoRun() {
         isQueueAutoPaused = true
         if isRunningQueue {
@@ -527,6 +532,7 @@ final class AppModel: ObservableObject {
         }
         pdfQueue[idx].status = .pending
         pdfQueue[idx].errorMessage = nil
+        isQueueAutoPaused = false
         if !isRunning {
             startQueue()
         }
@@ -539,8 +545,11 @@ final class AppModel: ObservableObject {
             pdfQueue[idx].errorMessage = nil
             resetCount += 1
         }
-        if resetCount > 0 && !isRunning {
-            startQueue()
+        if resetCount > 0 {
+            isQueueAutoPaused = false
+            if !isRunning {
+                startQueue()
+            }
         }
     }
 
@@ -658,6 +667,7 @@ final class AppModel: ObservableObject {
                 self.remainingText = "00:00"
                 self.refreshLibraryPDFs()
                 self.appendLog("\nMerged PDF saved to: \(mergedURL.path)\n")
+                self.startQueueIfAutoRunEnabled()
             } catch {
                 self.preflightTask = nil
                 self.isFetchingURL = false
@@ -666,6 +676,7 @@ final class AppModel: ObservableObject {
                 } else {
                     self.fail(error.localizedDescription)
                 }
+                self.startQueueIfAutoRunEnabled()
             }
         }
     }
@@ -1846,6 +1857,7 @@ final class AppModel: ObservableObject {
     private func finishJob(exitCode: Int32) {
         process = nil
         stopProgressClock()
+        defer { startQueueIfAutoRunEnabled() }
 
         if cancelRequested {
             runState = .idle
@@ -2147,10 +2159,6 @@ struct ContentView: View {
     var body: some View {
         NavigationSplitView {
             List(selection: $destination) {
-                Section("Mac") {
-                    Label(Destination.runtime.title(model.uiLanguage), systemImage: Destination.runtime.symbol)
-                        .tag(Destination.runtime)
-                }
                 Section(model.t("機能", "Features")) {
                     Label(Destination.dashboard.title(model.uiLanguage), systemImage: Destination.dashboard.symbol)
                         .tag(Destination.dashboard)
@@ -2162,6 +2170,8 @@ struct ContentView: View {
                         .tag(Destination.library)
                 }
                 Section(model.t("システム", "System")) {
+                    Label(Destination.runtime.title(model.uiLanguage), systemImage: Destination.runtime.symbol)
+                        .tag(Destination.runtime)
                     Label(Destination.models.title(model.uiLanguage), systemImage: Destination.models.symbol)
                         .tag(Destination.models)
                     Label(Destination.logs.title(model.uiLanguage), systemImage: Destination.logs.symbol)
@@ -2759,6 +2769,8 @@ struct ContentView: View {
                     Button(model.t("ローカルLLMを開く", "Open Local LLM")) { destination = .models }
                 }
 
+                dashboardRuntimeBox
+
                 GroupBox {
                     let recent = model.recentPDFs
                     if recent.isEmpty {
@@ -2812,6 +2824,61 @@ struct ContentView: View {
                 }
             }
             .padding(28)
+        }
+    }
+
+    private var dashboardRuntimeBox: some View {
+        let checks = model.runtimeChecks
+        let missing = checks.filter { !$0.ok }
+        let allReady = !checks.isEmpty && missing.isEmpty
+
+        return GroupBox {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 10) {
+                    Image(systemName: allReady ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                        .foregroundStyle(allReady ? .green : .orange)
+                    Text(
+                        allReady
+                            ? model.t("必要な実行環境はすべて揃っています。", "All required runtime tools are ready.")
+                            : model.t("未整備の実行環境が \(missing.count) 件あります。実行環境画面から導入・起動してください。", "\(missing.count) runtime item(s) need setup. Open Runtime to install or launch them.")
+                    )
+                    .font(.callout)
+                    Spacer()
+                    if !allReady {
+                        Button(model.t("実行環境を開いて整備する", "Open Runtime Setup")) {
+                            destination = .runtime
+                        }
+                        .buttonStyle(.borderedProminent)
+                    } else {
+                        Button(model.t("実行環境を確認", "View Runtime")) {
+                            destination = .runtime
+                        }
+                    }
+                }
+
+                if !checks.isEmpty {
+                    Divider()
+                    VStack(spacing: 6) {
+                        ForEach(checks) { item in
+                            HStack(spacing: 8) {
+                                Image(systemName: item.ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                                    .foregroundStyle(item.ok ? .green : .orange)
+                                Text(item.name)
+                                    .font(.caption.weight(.medium))
+                                Spacer()
+                                Text(item.detail)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(8)
+        } label: {
+            Text(model.t("実行環境の準備状況", "Runtime Environment"))
         }
     }
 

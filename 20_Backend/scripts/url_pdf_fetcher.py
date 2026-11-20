@@ -319,6 +319,9 @@ def inject_print_cleanup(page) -> dict:
                                     break-after: page !important; page-break-after: always !important;
                                     break-inside: avoid !important; page-break-inside: avoid !important;
                                 }
+                                .pdf-page:last-of-type {
+                                    break-after: auto !important; page-break-after: auto !important;
+                                }
                                 .pf {
                                     margin: 0 !important; border: none !important; box-shadow: none !important;
                                 }
@@ -445,7 +448,7 @@ def strip_trailing_blank_pages(pdf_bytes: bytes) -> bytes:
             last_non_blank = len(doc) - 1
             while last_non_blank > 0:
                 pg = doc[last_non_blank]
-                if pg.get_text().strip() or pg.get_images() or pg.get_drawings():
+                if pg.get_text().strip() or pg.get_images():
                     break
                 last_non_blank -= 1
             if last_non_blank < len(doc) - 1:

@@ -215,6 +215,28 @@ final class AppModel: ObservableObject {
     ]
     @Published var selectedTTSModelID = "macos:Kyoko"
     @Published var customModelURLText = ""
+    @Published var openAIAPIKey: String = UserDefaults.standard.string(forKey: "openAIAPIKey") ?? "" {
+        didSet {
+            UserDefaults.standard.set(openAIAPIKey, forKey: "openAIAPIKey")
+            refreshTTSModels()
+        }
+    }
+    @Published var openAITTSVoice: String = UserDefaults.standard.string(forKey: "openAITTSVoice") ?? "coral" {
+        didSet {
+            UserDefaults.standard.set(openAITTSVoice, forKey: "openAITTSVoice")
+        }
+    }
+    @Published var elevenLabsAPIKey: String = UserDefaults.standard.string(forKey: "elevenLabsAPIKey") ?? "" {
+        didSet {
+            UserDefaults.standard.set(elevenLabsAPIKey, forKey: "elevenLabsAPIKey")
+            refreshTTSModels()
+        }
+    }
+    @Published var elevenLabsVoiceID: String = UserDefaults.standard.string(forKey: "elevenLabsVoiceID") ?? "21m00Tcm4TlvDq8ikWAM" {
+        didSet {
+            UserDefaults.standard.set(elevenLabsVoiceID, forKey: "elevenLabsVoiceID")
+        }
+    }
     @Published var ollamaModels: [OllamaModelInfo] = []
     @Published var selectedOllamaModelName = ""
     @Published var ollamaPullName = "gemma3:4b"
@@ -793,11 +815,13 @@ final class AppModel: ObservableObject {
             return
         }
 
+        let env = mergedSubprocessEnvironment()
         Task { [weak self] in
             let decoded: [TTSModelItem]? = await Task.detached {
                 let proc = Process()
                 proc.executableURL = URL(fileURLWithPath: pythonCommand)
                 proc.arguments = [scriptURL.path, "--list-models"]
+                proc.environment = env
                 let pipe = Pipe()
                 proc.standardOutput = pipe
                 proc.standardError = Pipe()
@@ -1325,6 +1349,29 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func mergedSubprocessEnvironment() -> [String: String] {
+        var environment = ProcessInfo.processInfo.environment
+        environment["PATH"] = appPath()
+        environment["PYTHONUNBUFFERED"] = "1"
+        let openAI = openAIAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !openAI.isEmpty {
+            environment["OPENAI_API_KEY"] = openAI
+        }
+        let openAIVoice = openAITTSVoice.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !openAIVoice.isEmpty {
+            environment["OPENAI_TTS_VOICE"] = openAIVoice
+        }
+        let elevenKey = elevenLabsAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !elevenKey.isEmpty {
+            environment["ELEVENLABS_API_KEY"] = elevenKey
+        }
+        let elevenVoice = elevenLabsVoiceID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !elevenVoice.isEmpty {
+            environment["ELEVENLABS_VOICE_ID"] = elevenVoice
+        }
+        return environment
+    }
+
     private func runPythonSubprocess(
         pythonCommand: String,
         arguments: [String],
@@ -1336,10 +1383,7 @@ final class AppModel: ObservableObject {
         proc.arguments = arguments
         proc.currentDirectoryURL = workingDirectory
 
-        var environment = ProcessInfo.processInfo.environment
-        environment["PATH"] = appPath()
-        environment["PYTHONUNBUFFERED"] = "1"
-        proc.environment = environment
+        proc.environment = mergedSubprocessEnvironment()
 
         let pipe = Pipe()
         proc.standardOutput = pipe
@@ -2712,12 +2756,67 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(model.t("AI接続の管理", "Manage AI Connections"))
                         .font(.title2.bold())
-                    Text(model.t("Ollamaの言語モデルを選択・ダウンロードし、推論を確認できます。", "Select and download Ollama language models, and test inference."))
+                    Text(model.t("音声変換 (Audio Lab) で使えるクラウドTTS API（OpenAI / ElevenLabs）と、テキスト整形・要約用のローカルLLM（Ollama）を管理します。", "Configure cloud TTS APIs (OpenAI / ElevenLabs) for Audio Lab and local LLMs (Ollama) for text preparation."))
                         .foregroundStyle(.secondary)
+                }
+
+                GroupBox(model.t("音声変換のおすすめ API 接続 (Audio Lab)", "Recommended TTS APIs for Audio Lab")) {
+                    VStack(alignment: .leading, spacing: 14) {
+                        Text(model.t("APIキーを設定すると、「音声変換 (Audio Lab)」の音声モデル一覧からクラウド高音質音声を直接選択できます。（※ Edge TTS は API キー不要・無料で利用できます）", "Once configured, cloud voices appear directly in Audio Lab's Voice Model picker. (Edge TTS works for free without an API key.)"))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        Divider()
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Label("OpenAI TTS (gpt-4o-mini-tts / tts-1)", systemImage: "waveform.circle")
+                                    .font(.headline)
+                                Spacer()
+                                Text(model.openAIAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? model.t("未設定", "Not Set") : model.t("設定済み", "Configured"))
+                                    .font(.caption)
+                                    .foregroundStyle(model.openAIAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Color.secondary : Color.green)
+                            }
+                            HStack(spacing: 10) {
+                                SecureField("OPENAI_API_KEY (sk-...)", text: $model.openAIAPIKey)
+                                    .textFieldStyle(.roundedBorder)
+                                Picker(model.t("声質", "Voice"), selection: $model.openAITTSVoice) {
+                                    ForEach(["coral", "alloy", "nova", "sage", "shimmer", "onyx"], id: \.self) { v in
+                                        Text(v).tag(v)
+                                    }
+                                }
+                                .frame(width: 130)
+                            }
+                        }
+
+                        Divider()
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Label("ElevenLabs (eleven_multilingual_v2)", systemImage: "sparkles")
+                                    .font(.headline)
+                                Spacer()
+                                Text(model.elevenLabsAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? model.t("未設定", "Not Set") : model.t("設定済み", "Configured"))
+                                    .font(.caption)
+                                    .foregroundStyle(model.elevenLabsAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Color.secondary : Color.green)
+                            }
+                            HStack(spacing: 10) {
+                                SecureField("ELEVENLABS_API_KEY", text: $model.elevenLabsAPIKey)
+                                    .textFieldStyle(.roundedBorder)
+                                TextField("Voice ID", text: $model.elevenLabsVoiceID)
+                                    .textFieldStyle(.roundedBorder)
+                                    .frame(width: 210)
+                            }
+                        }
+                    }
+                    .padding(8)
                 }
 
                 GroupBox("ローカル LLM (Ollama)") {
                     VStack(alignment: .leading, spacing: 12) {
+                        Text(model.t("※ 音声読み上げ自体は macOS say / Edge TTS / クラウドTTS API で動作するため、Ollama は未設定でも音声変換できます（今後のテキスト整形・要約用）。", "Note: Audio Lab uses macOS say, Edge TTS, or cloud TTS APIs for speech synthesis; Ollama is optional (for future text prep/summarization)."))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Ollama")

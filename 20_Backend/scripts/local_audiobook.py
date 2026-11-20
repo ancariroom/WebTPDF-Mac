@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -77,6 +78,30 @@ CATALOG_MODELS = [
         "language": "eng",
         "languages": ["jpn", "eng", "zho", "kor", "fra", "deu", "spa"],
     },
+    {
+        "id": "openai:gpt-4o-mini-tts",
+        "name": "API: OpenAI gpt-4o-mini-tts (自然・多言語)",
+        "engine": "openai",
+        "voice": "coral",
+        "language": "jpn",
+        "languages": ["jpn", "eng", "zho", "kor", "fra", "deu", "spa"],
+    },
+    {
+        "id": "openai:tts-1",
+        "name": "API: OpenAI tts-1 (高速・低コスト)",
+        "engine": "openai",
+        "voice": "nova",
+        "language": "jpn",
+        "languages": ["jpn", "eng", "zho", "kor", "fra", "deu", "spa"],
+    },
+    {
+        "id": "elevenlabs:eleven_multilingual_v2",
+        "name": "API: ElevenLabs Multilingual v2 (高表現力)",
+        "engine": "elevenlabs",
+        "voice": "21m00Tcm4TlvDq8ikWAM",
+        "language": "jpn",
+        "languages": ["jpn", "eng", "zho", "kor", "fra", "deu", "spa"],
+    },
 ]
 
 
@@ -112,6 +137,10 @@ def list_models_payload() -> list[dict[str, object]]:
     for entry in CATALOG_MODELS:
         if entry["engine"] == "say":
             installed = (entry["voice"] in say_voices) if say_voices else True
+        elif entry["engine"] == "openai":
+            installed = bool(os.environ.get("OPENAI_API_KEY", "").strip())
+        elif entry["engine"] == "elevenlabs":
+            installed = bool(os.environ.get("ELEVENLABS_API_KEY", "").strip())
         else:
             installed = edge_ok
         items.append({**entry, "installed": installed})
@@ -283,6 +312,141 @@ def synthesize_edge(text: str, out_mp3: Path, voice: str) -> None:
     asyncio.run(_synthesize_edge_async(text, out_mp3, voice))
 
 
+def split_text_chunks(text: str, max_chars: int = 3500) -> list[str]:
+    """Split long text on sentence/newline boundaries for cloud TTS API limits."""
+    cleaned = text.strip()
+    if not cleaned:
+        return []
+    if len(cleaned) <= max_chars:
+        return [cleaned]
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for para in cleaned.splitlines():
+        line = para.strip()
+        if not line:
+            continue
+        while len(line) > max_chars:
+            if current:
+                chunks.append("\n".join(current))
+                current = []
+                current_len = 0
+            chunks.append(line[:max_chars])
+            line = line[max_chars:]
+        if current_len + len(line) + 1 > max_chars and current:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_len = len(line)
+        else:
+            current.append(line)
+            current_len += len(line) + 1
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+def _concat_mp3_chunks(chunk_paths: list[Path], out_mp3: Path) -> None:
+    """Concatenate one or more MP3 chunks into out_mp3."""
+    if len(chunk_paths) == 1:
+        chunk_paths[0].replace(out_mp3)
+        return
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        with out_mp3.open("wb") as dst:
+            for p in chunk_paths:
+                dst.write(p.read_bytes())
+        return
+    with tempfile.TemporaryDirectory(prefix="api_tts_concat_") as tmp_dir:
+        concat_list = Path(tmp_dir) / "inputs.txt"
+        concat_list.write_text("\n".join(f"file '{p.as_posix()}'" for p in chunk_paths), encoding="utf-8")
+        subprocess.run(
+            [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list), "-c", "copy", str(out_mp3)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+
+
+def synthesize_openai(text: str, out_mp3: Path, model_name: str, voice: str) -> None:
+    """Synthesize text to MP3 via OpenAI Audio Speech API."""
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY が未設定です。「AI接続」画面から API キーを設定してください。")
+    chosen_voice = os.environ.get("OPENAI_TTS_VOICE", "").strip() or voice or "coral"
+    chunks = split_text_chunks(text, max_chars=3500)
+    if not chunks:
+        return
+
+    with tempfile.TemporaryDirectory(prefix="openai_tts_") as tmp_dir:
+        tmp_root = Path(tmp_dir)
+        chunk_paths: list[Path] = []
+        for idx, chunk in enumerate(chunks, start=1):
+            payload = json.dumps({
+                "model": model_name,
+                "input": chunk,
+                "voice": chosen_voice,
+                "response_format": "mp3",
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                "https://api.openai.com/v1/audio/speech",
+                data=payload,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    part = tmp_root / f"chunk_{idx:04d}.mp3"
+                    part.write_bytes(resp.read())
+                    chunk_paths.append(part)
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")[:300]
+                raise RuntimeError(f"OpenAI TTS API エラー ({exc.code}): {detail}") from exc
+        _concat_mp3_chunks(chunk_paths, out_mp3)
+
+
+def synthesize_elevenlabs(text: str, out_mp3: Path, model_id: str, default_voice_id: str) -> None:
+    """Synthesize text to MP3 via ElevenLabs Text-to-Speech API."""
+    api_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("ELEVENLABS_API_KEY が未設定です。「AI接続」画面から API キーを設定してください。")
+    voice_id = os.environ.get("ELEVENLABS_VOICE_ID", "").strip() or default_voice_id or "21m00Tcm4TlvDq8ikWAM"
+    chunks = split_text_chunks(text, max_chars=3800)
+    if not chunks:
+        return
+
+    with tempfile.TemporaryDirectory(prefix="elevenlabs_tts_") as tmp_dir:
+        tmp_root = Path(tmp_dir)
+        chunk_paths: list[Path] = []
+        for idx, chunk in enumerate(chunks, start=1):
+            payload = json.dumps({
+                "text": chunk,
+                "model_id": model_id,
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+                data=payload,
+                headers={
+                    "xi-api-key": api_key,
+                    "Content-Type": "application/json",
+                    "Accept": "audio/mpeg",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    part = tmp_root / f"chunk_{idx:04d}.mp3"
+                    part.write_bytes(resp.read())
+                    chunk_paths.append(part)
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")[:300]
+                raise RuntimeError(f"ElevenLabs API エラー ({exc.code}): {detail}") from exc
+        _concat_mp3_chunks(chunk_paths, out_mp3)
+
+
 def find_ffmpeg() -> str | None:
     """Locate ffmpeg binary if installed."""
     candidates = [
@@ -378,12 +542,23 @@ def main() -> int:
 
     selected_model = args.model.strip()
     use_edge = selected_model.startswith("edge:")
+    use_openai = selected_model.startswith("openai:")
+    use_elevenlabs = selected_model.startswith("elevenlabs:")
     edge_voice = selected_model.split(":", 1)[1] if use_edge else ""
+    openai_model = selected_model.split(":", 1)[1] if use_openai else ""
+    eleven_model = selected_model.split(":", 1)[1] if use_elevenlabs else ""
     say_voice_name = selected_model.split(":", 1)[1] if selected_model.startswith("macos:") else args.voice
-    say_voice = None if use_edge else resolve_say_voice(args.language, say_voice_name)
+    say_voice = None if (use_edge or use_openai or use_elevenlabs) else resolve_say_voice(args.language, say_voice_name)
 
-    engine_label = f"Neural edge-tts ({edge_voice})" if use_edge else f"macOS say ({say_voice or 'default'})"
-    log(f"Local TTS (no Docker): {len(chapters)} section(s), model={engine_label}")
+    if use_openai:
+        engine_label = f"OpenAI TTS API ({openai_model})"
+    elif use_elevenlabs:
+        engine_label = f"ElevenLabs API ({eleven_model})"
+    elif use_edge:
+        engine_label = f"Neural edge-tts ({edge_voice})"
+    else:
+        engine_label = f"macOS say ({say_voice or 'default'})"
+    log(f"Audio Lab TTS: {len(chapters)} section(s), model={engine_label}")
 
     with tempfile.TemporaryDirectory(prefix="local_tts_parts_") as tmp_dir:
         tmp_root = Path(tmp_dir)
@@ -393,7 +568,13 @@ def main() -> int:
         for idx, (title, text) in enumerate(chapters, start=1):
             pct = (idx - 1) / total * 100.0
             log(f"{pct:.2f}%: {idx - 1}/{total} Synthesizing {title}...")
-            if use_edge:
+            if use_openai:
+                part_file = tmp_root / f"part_{idx:04d}.mp3"
+                synthesize_openai(text, part_file, openai_model, os.environ.get("OPENAI_TTS_VOICE", "coral"))
+            elif use_elevenlabs:
+                part_file = tmp_root / f"part_{idx:04d}.mp3"
+                synthesize_elevenlabs(text, part_file, eleven_model, "21m00Tcm4TlvDq8ikWAM")
+            elif use_edge:
                 part_file = tmp_root / f"part_{idx:04d}.mp3"
                 synthesize_edge(text, part_file, edge_voice)
             else:

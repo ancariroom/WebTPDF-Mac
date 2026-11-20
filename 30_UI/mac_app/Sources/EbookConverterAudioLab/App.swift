@@ -1066,25 +1066,41 @@ final class AppModel: ObservableObject {
         return nil
     }
 
+    var appVersionDisplay: String {
+        let ver = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
+        let sha = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "-"
+        return "v\(ver) (\(sha))"
+    }
+
     func updateAndRelaunchApp() {
         guard let repoRoot = resolveRepoRoot() else {
             fail("WebTPDF-Mac リポジトリが見つかりませんでした。")
             return
         }
 
+        let currentDisplay = appVersionDisplay
         cancelRequested = false
         runState = .running
-        statusMessage = t("アップデート中 (git pull & 再ビルド)...", "Updating (git pull & rebuild)...")
+        statusMessage = t("アップデート中 (\(currentDisplay) -> 最新版)...", "Updating (\(currentDisplay) -> latest)...")
         progressFraction = nil
         progressText = t("更新中", "Updating")
         remainingText = "-"
-        logText = "Updating WebTPDF Mac from \(repoRoot.path)...\n"
+        logText = "Current app version: \(currentDisplay)\nUpdating WebTPDF Mac from \(repoRoot.path)...\n"
         startProgressClock()
 
         let script = """
         set -e
         cd "\(repoRoot.path)"
+        BEFORE_CNT=$(git rev-list --count HEAD)
+        BEFORE_SHA=$(git rev-parse --short HEAD)
         git pull --ff-only origin main
+        AFTER_CNT=$(git rev-list --count HEAD)
+        AFTER_SHA=$(git rev-parse --short HEAD)
+        echo "Version: v0.1.${BEFORE_CNT} (${BEFORE_SHA}) -> v0.1.${AFTER_CNT} (${AFTER_SHA})"
+        if [ "$BEFORE_SHA" != "$AFTER_SHA" ]; then
+          echo "Changes:"
+          git log --oneline "${BEFORE_SHA}..${AFTER_SHA}"
+        fi
         zsh "30_UI/mac_app/build_mac_app.sh"
         """
 
@@ -1096,6 +1112,7 @@ final class AppModel: ObservableObject {
             guard let self else { return }
             self.stopProgressClock()
             if exitCode == 0 {
+                UserDefaults.standard.set(currentDisplay, forKey: "lastUpdatedFromVersion")
                 self.runState = .completed
                 self.statusMessage = self.t("アップデート完了・再起動中...", "Update complete. Relaunching...")
                 let appPath = repoRoot.appendingPathComponent("40_Ops/apps/WebTPDF Mac.app").path
@@ -2783,10 +2800,21 @@ struct ContentView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("実行環境の診断")
-                        .font(.title2.bold())
-                    Text("URLからのPDF取得・ローカル音声変換・LLM連携に必要なコンポーネントの状態を確認します。")
+                    HStack {
+                        Text("実行環境の診断")
+                            .font(.title2.bold())
+                        Spacer()
+                        Text(model.t("現在バージョン: \(model.appVersionDisplay)", "Version: \(model.appVersionDisplay)"))
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                    Text("URLからのPDF取得・ローカル音声変換・AI連携に必要なコンポーネントの状態を確認します。")
                         .foregroundStyle(.secondary)
+                    if let prev = UserDefaults.standard.string(forKey: "lastUpdatedFromVersion"), !prev.isEmpty, prev != model.appVersionDisplay {
+                        Text(model.t("前回のアップデート: \(prev) → \(model.appVersionDisplay)", "Last update: \(prev) → \(model.appVersionDisplay)"))
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                    }
                 }
 
                 GroupBox("ランタイム診断") {

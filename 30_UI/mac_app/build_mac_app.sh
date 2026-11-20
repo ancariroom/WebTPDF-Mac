@@ -10,6 +10,9 @@ MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 EXECUTABLE="$MACOS_DIR/WebTPDFMac"
 CODESIGN_IDENTITY=${CODESIGN_IDENTITY:-"-"}
+GIT_COMMIT_COUNT=$(git -C "$PRODUCT_ROOT" rev-list --count HEAD 2>/dev/null || echo "1")
+GIT_SHORT_SHA=$(git -C "$PRODUCT_ROOT" rev-parse --short HEAD 2>/dev/null || echo "dev")
+APP_VERSION="0.1.${GIT_COMMIT_COUNT}"
 
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR" "$BUILD_DIR"
 
@@ -56,9 +59,9 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.1.0</string>
+  <string>${APP_VERSION}</string>
   <key>CFBundleVersion</key>
-  <string>1</string>
+  <string>${GIT_SHORT_SHA}</string>
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
   <key>NSHighResolutionCapable</key>

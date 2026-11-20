@@ -361,6 +361,17 @@ def inject_print_cleanup(page) -> dict:
                             overflow: visible !important;
                             height: auto !important;
                             max-height: none !important;
+                            width: 100% !important;
+                            max-width: none !important;
+                            margin: 0 !important;
+                            padding: 0 !important;
+                        }
+                        header, nav, footer, aside,
+                        [role="complementary"], [role="navigation"], [role="banner"],
+                        [class*="sidebar" i], [class*="drawer" i],
+                        [class*="sidePanel" i], [class*="side-panel" i],
+                        [class*="other-formats" i] {
+                            display: none !important;
                         }
                         p, li, h1, h2, h3, h4, h5, h6, pre, blockquote, tr, figure, img {
                             break-inside: avoid;
@@ -371,6 +382,33 @@ def inject_print_cleanup(page) -> dict:
                     }
                 `;
                 document.head.appendChild(style);
+
+                const rt = document.querySelector('#sbo-rt-content, .sbo-reader-content, [data-testid="book-content"], main article, main');
+                if (rt && ((rt.innerText || '').trim().length > 0 || rt.querySelector('img, canvas, svg'))) {
+                    let cur = rt;
+                    while (cur && cur.parentElement && cur.parentElement !== document.body) {
+                        for (const sib of cur.parentElement.children) {
+                            if (sib !== cur && sib.tagName !== 'STYLE' && sib.tagName !== 'SCRIPT') {
+                                sib.setAttribute('data-ec-hide', sib.style.display || '');
+                                sib.style.setProperty('display', 'none', 'important');
+                            }
+                        }
+                        cur.parentElement.setAttribute('data-ec-style', cur.parentElement.getAttribute('style') || '');
+                        cur.parentElement.style.setProperty('display', 'block', 'important');
+                        cur.parentElement.style.setProperty('width', '100%', 'important');
+                        cur.parentElement.style.setProperty('max-width', 'none', 'important');
+                        cur.parentElement.style.setProperty('min-width', '0', 'important');
+                        cur.parentElement.style.setProperty('padding', '0', 'important');
+                        cur.parentElement.style.setProperty('margin', '0', 'important');
+                        cur = cur.parentElement;
+                    }
+                    rt.setAttribute('data-ec-style', rt.getAttribute('style') || '');
+                    rt.style.setProperty('display', 'block', 'important');
+                    rt.style.setProperty('width', '100%', 'important');
+                    rt.style.setProperty('max-width', 'none', 'important');
+                    rt.style.setProperty('min-width', '0', 'important');
+                    rt.style.setProperty('margin', '0 auto', 'important');
+                }
 
                 for (const el of document.querySelectorAll('*')) {
                     const pos = window.getComputedStyle(el).position;
@@ -405,6 +443,15 @@ def remove_print_cleanup(page) -> None:
                     el.style.removeProperty('height');
                     el.style.removeProperty('min-height');
                     el.removeAttribute('data-ec-pad');
+                }
+                for (const el of document.querySelectorAll('[data-ec-style]')) {
+                    const origStyle = el.getAttribute('data-ec-style');
+                    if (origStyle) {
+                        el.setAttribute('style', origStyle);
+                    } else {
+                        el.removeAttribute('style');
+                    }
+                    el.removeAttribute('data-ec-style');
                 }
                 for (const el of document.querySelectorAll('[data-ec-orig-pos]')) {
                     const orig = el.getAttribute('data-ec-orig-pos');

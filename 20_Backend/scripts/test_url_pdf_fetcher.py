@@ -155,6 +155,21 @@ class UrlPdfFetcherTests(unittest.TestCase):
             """,
             encoding="utf-8",
         )
+        (self.root / "sidebar_layout.html").write_text(
+            """
+            <html><body>
+              <header>TOP_BANNER_SHOULD_HIDE</header>
+              <div style="display:flex;">
+                <main id="sbo-rt-content" style="width:300px;">
+                  <h1>Main Chapter Title</h1>
+                  <p>READER_BODY_CONTENT_LINE</p>
+                </main>
+                <aside class="sidebar">SIDEBAR_EXPLANATION_SHOULD_HIDE</aside>
+              </div>
+            </body></html>
+            """,
+            encoding="utf-8",
+        )
         handler = functools.partial(QuietHandler, directory=str(self.root))
         self.httpd = socketserver.TCPServer(("127.0.0.1", 0), handler)
         self.port = self.httpd.server_address[1]
@@ -268,6 +283,21 @@ class UrlPdfFetcherTests(unittest.TestCase):
         sig_red = fetcher.pdf_content_signature(make_image_pdf((255, 0, 0)))
         sig_blue = fetcher.pdf_content_signature(make_image_pdf((0, 0, 255)))
         self.assertNotEqual(sig_red, sig_blue)
+
+    def test_sidebar_and_header_hidden_in_reader_pdf(self) -> None:
+        out_pdf = self.root / "out_sidebar.pdf"
+        pages = fetcher.fetch_and_merge(
+            url=f"http://127.0.0.1:{self.port}/sidebar_layout.html",
+            output_path=out_pdf,
+            max_pages=2,
+            allow_browser=True,
+        )
+        self.assertEqual(pages, 1)
+        reader = PdfReader(str(out_pdf))
+        text = "\n".join(p.extract_text() or "" for p in reader.pages)
+        self.assertIn("READER_BODY_CONTENT_LINE", text)
+        self.assertNotIn("SIDEBAR_EXPLANATION_SHOULD_HIDE", text)
+        self.assertNotIn("TOP_BANNER_SHOULD_HIDE", text)
 
 
 if __name__ == "__main__":

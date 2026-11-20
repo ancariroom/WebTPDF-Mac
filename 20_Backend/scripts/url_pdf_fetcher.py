@@ -459,133 +459,57 @@ def strip_trailing_blank_pages(pdf_bytes: bytes) -> bytes:
     return pdf_bytes
 
 
-def capture_fixed_layout_pf_pages(page, cdp_session) -> bytes | None:
-    """Render each .pf fixed-layout page individually as a 1:1 PDF page and merge them."""
-    pf_count = page.evaluate("() => document.querySelectorAll('.pf').length")
+def capture_fixed_layout_pf_pages(page, cdp_session=None) -> bytes | None:
+    """Capture each .pf fixed-layout page via element screenshot so scaled/absolute layouts never clip."""
+    pfs = page.locator(".pf")
+    pf_count = pfs.count()
     if not pf_count:
         return None
 
-    import fitz
-
-    out_doc = fitz.open()
     try:
-        for target_idx in range(pf_count):
-            dims = page.evaluate(
-                """([styleId, targetIdx]) => {
-                    const pfs = Array.from(document.querySelectorAll('.pf'));
-                    const pf = pfs[targetIdx];
-                    if (!pf) return null;
+        page.evaluate(
+            """() => {
+                document.querySelectorAll('header, nav, [class*="iconMenu"], [class*="bottomIcons"]').forEach(el => {
+                    el.setAttribute('data-ec-pf-hide', el.style.display || '');
+                    el.style.setProperty('display', 'none', 'important');
+                });
+            }"""
+        )
+        images: list[Image.Image] = []
+        try:
+            for idx in range(pf_count):
+                el = pfs.nth(idx)
+                el.scroll_into_view_if_needed(timeout=5000)
+                png_bytes = el.screenshot(timeout=15000)
+                with Image.open(io.BytesIO(png_bytes)) as opened:
+                    images.append(opened.convert("RGB"))
 
-                    const st = window.getComputedStyle(pf);
-                    const w = Math.ceil(parseFloat(st.width) || pf.offsetWidth);
-                    const h = Math.ceil(parseFloat(st.height) || pf.offsetHeight);
-                    if (w <= 100 || h <= 100) return null;
+            if not images:
+                return None
 
-                    document.getElementById(styleId)?.remove();
-                    const style = document.createElement('style');
-                    style.id = styleId;
-                    style.textContent = `
-                        @page { size: ${w}px ${h}px !important; margin: 0 !important; }
-                        @media print {
-                            html, body {
-                                width: ${w}px !important; height: ${h}px !important;
-                                margin: 0 !important; padding: 0 !important;
-                                overflow: hidden !important; background: #fff !important;
-                            }
-                            header, nav, footer { display: none !important; }
-                            #sbo-rt-content, #pdf-main, .pdf-page {
-                                margin: 0 !important; padding: 0 !important;
-                                transform: none !important; width: ${w}px !important;
-                                max-width: ${w}px !important; min-width: 0 !important;
-                                height: auto !important; min-height: 0 !important;
-                                position: static !important; left: 0 !important; top: 0 !important;
-                            }
-                            .pf {
-                                margin: 0 !important; border: none !important; box-shadow: none !important;
-                            }
-                        }
-                    `;
-                    document.head.appendChild(style);
-
-                    if (targetIdx === 0) {
-                        const rt = document.querySelector('#sbo-rt-content') || document.querySelector('#pdf-main') || pf.parentElement;
-                        let cur = rt;
-                        while (cur && cur.parentElement && cur.parentElement !== document.body) {
-                            for (const sib of cur.parentElement.children) {
-                                if (sib !== cur && sib.tagName !== 'STYLE' && sib.tagName !== 'SCRIPT') {
-                                    sib.setAttribute('data-ec-hide', sib.style.display || '');
-                                    sib.style.setProperty('display', 'none', 'important');
-                                }
-                            }
-                            cur.parentElement.setAttribute('data-ec-pad', cur.parentElement.style.padding || '');
-                            cur.parentElement.style.setProperty('display', 'block', 'important');
-                            cur.parentElement.style.setProperty('padding', '0', 'important');
-                            cur.parentElement.style.setProperty('margin', '0', 'important');
-                            cur.parentElement.style.setProperty('height', 'auto', 'important');
-                            cur.parentElement.style.setProperty('min-height', '0', 'important');
-                            cur = cur.parentElement;
-                        }
-                    }
-
-                    pfs.forEach((el, i) => {
-                        const holder = el.closest('.pdf-page') || el;
-                        if (i === targetIdx) {
-                            holder.style.removeProperty('display');
-                            el.style.removeProperty('display');
-                        } else {
-                            holder.style.setProperty('display', 'none', 'important');
-                        }
-                    });
-                    return { w, h };
-                }""",
-                [PRINT_CLEANUP_STYLE_ID, target_idx],
+            buf = io.BytesIO()
+            images[0].save(
+                buf,
+                "PDF",
+                save_all=True,
+                append_images=images[1:],
             )
-            if not dims:
-                continue
-
-            pdf_params = {
-                "printBackground": True,
-                "preferCSSPageSize": True,
-                "marginTop": 0,
-                "marginBottom": 0,
-                "marginLeft": 0,
-                "marginRight": 0,
-                "pageRanges": "1",
-            }
-            data: bytes | None = None
-            if cdp_session is not None:
-                try:
-                    import base64
-
-                    res = cdp_session.send("Page.printToPDF", pdf_params)
-                    raw = base64.b64decode(res["data"])
-                    if is_pdf_bytes(raw):
-                        data = raw
-                except Exception:
-                    data = None
-            if data is None:
-                data = page.pdf(
-                    print_background=True,
-                    prefer_css_page_size=True,
-                    margin={"top": "0", "bottom": "0", "left": "0", "right": "0"},
-                    page_ranges="1",
-                )
-
-            with fitz.open(stream=data, filetype="pdf") as one:
-                out_doc.insert_pdf(one)
-
-        return out_doc.tobytes() if len(out_doc) > 0 else None
+            return buf.getvalue()
+        finally:
+            for img in images:
+                img.close()
     finally:
-        out_doc.close()
         try:
             page.evaluate(
                 """() => {
-                    document.querySelectorAll('.pf, .pdf-page').forEach(el => el.style.removeProperty('display'));
+                    document.querySelectorAll('[data-ec-pf-hide]').forEach(el => {
+                        el.style.display = el.getAttribute('data-ec-pf-hide');
+                        el.removeAttribute('data-ec-pf-hide');
+                    });
                 }"""
             )
         except Exception:
             pass
-        remove_print_cleanup(page)
 
 
 def capture_page_as_pdf_bytes(page, cdp_session=None) -> bytes:

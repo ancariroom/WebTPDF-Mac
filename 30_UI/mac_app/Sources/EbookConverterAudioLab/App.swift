@@ -199,6 +199,7 @@ final class AppModel: ObservableObject {
     @Published var selectedOllamaModelName = ""
     @Published var ollamaPullName = "gemma3:4b"
     @Published private(set) var isRefreshingOllama = false
+    @Published private(set) var ollamaReachable = false
     @Published private(set) var ollamaStatusMessage = "未確認"
     @Published private(set) var isTestingOllama = false
     @Published private(set) var ollamaTestOutput = ""
@@ -693,18 +694,21 @@ final class AppModel: ObservableObject {
                 request.timeoutInterval = 3
                 let (data, response) = try await URLSession.shared.data(for: request)
                 guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                    self.ollamaReachable = false
                     self.ollamaModels = []
                     self.ollamaStatusMessage = "Ollama API に接続できません (127.0.0.1:11434)"
                     self.isRefreshingOllama = false
                     return
                 }
                 let decoded = try JSONDecoder().decode(OllamaTagsResponse.self, from: data)
+                self.ollamaReachable = true
                 self.ollamaModels = decoded.models
                 if !decoded.models.contains(where: { $0.name == self.selectedOllamaModelName }) {
                     self.selectedOllamaModelName = decoded.models.first?.name ?? ""
                 }
-                self.ollamaStatusMessage = decoded.models.isEmpty ? "モデル未インストール" : "\(decoded.models.count)件のモデルを検出"
+                self.ollamaStatusMessage = decoded.models.isEmpty ? "起動中 (モデル未DL)" : "\(decoded.models.count)件のモデルを検出"
             } catch {
+                self.ollamaReachable = false
                 self.ollamaModels = []
                 self.ollamaStatusMessage = "Ollama が起動していません（Ollama.app 起動後に再読み込み）"
             }
@@ -754,14 +758,35 @@ final class AppModel: ObservableObject {
     }
 
     func refreshRuntimeChecks() {
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
         let pythonPath = resolvePythonCommand()
-        let ffmpegPath = findExecutable(["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"])
+        let ffmpegPath = findExecutable([
+            "\(home)/.local/bin/ffmpeg",
+            "/opt/homebrew/bin/ffmpeg",
+            "/usr/local/bin/ffmpeg",
+        ])
         let sayOk = FileManager.default.isExecutableFile(atPath: "/usr/bin/say")
         let chromeOk = FileManager.default.isExecutableFile(atPath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
         let ollamaPath = resolveOllamaCommand()
         let ollamaAppExists = FileManager.default.fileExists(atPath: "/Applications/Ollama.app")
-        let brewPath = findExecutable(["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]) ?? "brew"
+        let brewPath = findExecutable(["/opt/homebrew/bin/brew", "/usr/local/bin/brew"])
         let py = pythonPath ?? "python3"
+
+        let ffmpegInstallShell = """
+        if [ -x /opt/homebrew/bin/brew ] || [ -x /usr/local/bin/brew ]; then
+          BREW=$([ -x /opt/homebrew/bin/brew ] && echo /opt/homebrew/bin/brew || echo /usr/local/bin/brew)
+          "$BREW" install ffmpeg
+        else
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL "https://evermeet.cx/ffmpeg/getrelease/zip" -o /tmp/webtpdf_ffmpeg.zip
+          unzip -o /tmp/webtpdf_ffmpeg.zip -d "$HOME/.local/bin"
+          chmod +x "$HOME/.local/bin/ffmpeg"
+          rm -f /tmp/webtpdf_ffmpeg.zip
+        fi
+        """
+        let ffmpegUpdateShell = brewPath != nil
+            ? "\"\(brewPath!)\" upgrade ffmpeg || true"
+            : ffmpegInstallShell
 
         runtimeChecks = [
             RuntimeCheckItem(
@@ -778,7 +803,7 @@ final class AppModel: ObservableObject {
                 ok: chromeOk,
                 detail: chromeOk ? t("利用可能", "Available") : t("未検出", "Not found"),
                 actionTitle: chromeOk ? t("ログイン用を開く", "Open Browser") : t("導入", "Install"),
-                actionShell: chromeOk ? nil : "\"\(brewPath)\" install --cask google-chrome"
+                actionShell: chromeOk ? nil : "\"\(brewPath ?? "brew")\" install --cask google-chrome"
             ),
             RuntimeCheckItem(
                 id: "say",
@@ -794,17 +819,17 @@ final class AppModel: ObservableObject {
                 ok: ffmpegPath != nil,
                 detail: ffmpegPath ?? t("未検出", "Not found"),
                 actionTitle: t(ffmpegPath == nil ? "導入" : "更新", ffmpegPath == nil ? "Install" : "Update"),
-                actionShell: ffmpegPath == nil ? "\"\(brewPath)\" install ffmpeg" : "\"\(brewPath)\" upgrade ffmpeg || true"
+                actionShell: ffmpegPath == nil ? ffmpegInstallShell : ffmpegUpdateShell
             ),
             RuntimeCheckItem(
                 id: "ollama",
                 name: t("Ollama (ローカルLLM)", "Ollama (Local LLM)"),
-                ok: ollamaPath != nil && !ollamaModels.isEmpty,
+                ok: ollamaReachable,
                 detail: ollamaStatusMessage,
                 actionTitle: ollamaAppExists ? t("起動", "Launch") : t("導入", "Install"),
                 actionShell: ollamaAppExists
-                    ? "open -a Ollama && sleep 2"
-                    : "\"\(brewPath)\" install --cask ollama && open -a Ollama"
+                    ? "open -a Ollama && for i in {1..10}; do curl -sf http://127.0.0.1:11434/api/tags >/dev/null && break; sleep 0.5; done"
+                    : "\"\(brewPath ?? "brew")\" install --cask ollama && open -a Ollama && for i in {1..10}; do curl -sf http://127.0.0.1:11434/api/tags >/dev/null && break; sleep 0.5; done"
             ),
         ]
     }
@@ -1861,6 +1886,7 @@ final class AppModel: ObservableObject {
     private func appPath() -> String {
         let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
         return [
+            "\(home)/.local/bin",
             "/usr/local/bin",
             "/opt/homebrew/bin",
             "\(home)/.pyenv/shims",

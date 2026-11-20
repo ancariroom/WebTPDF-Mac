@@ -285,7 +285,13 @@ def synthesize_edge(text: str, out_mp3: Path, voice: str) -> None:
 
 def find_ffmpeg() -> str | None:
     """Locate ffmpeg binary if installed."""
-    for candidate in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", shutil.which("ffmpeg")]:
+    candidates = [
+        str(Path.home() / ".local" / "bin" / "ffmpeg"),
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        shutil.which("ffmpeg"),
+    ]
+    for candidate in candidates:
         if candidate and Path(candidate).is_file():
             return candidate
     return None

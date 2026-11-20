@@ -138,6 +138,23 @@ class UrlPdfFetcherTests(unittest.TestCase):
             """,
             encoding="utf-8",
         )
+        (self.root / "fixed_layout.html").write_text(
+            """
+            <html><head><style>
+              .pf { width: 420px; height: 595px; position: relative; }
+              #pdf-main { transform: scale(1.5); transform-origin: 0 0; }
+            </style></head><body>
+              <div id="sbo-rt-content">
+                <div id="pdf-main">
+                  <div class="pdf-page"><div class="pf">FixedPage_001</div></div>
+                  <div class="pdf-page"><div class="pf">FixedPage_002</div></div>
+                  <div class="pdf-page"><div class="pf">FixedPage_003</div></div>
+                </div>
+              </div>
+            </body></html>
+            """,
+            encoding="utf-8",
+        )
         handler = functools.partial(QuietHandler, directory=str(self.root))
         self.httpd = socketserver.TCPServer(("127.0.0.1", 0), handler)
         self.port = self.httpd.server_address[1]
@@ -226,6 +243,18 @@ class UrlPdfFetcherTests(unittest.TestCase):
         compact_text = "".join(joined_text.split())
         for i in range(1, 65):
             self.assertIn(f"LineMarker_{i:03d}", compact_text)
+
+    def test_fixed_layout_pf_pages_one_to_one(self) -> None:
+        out_pdf = self.root / "out_fixed.pdf"
+        pages = fetcher.fetch_and_merge(
+            url=f"http://127.0.0.1:{self.port}/fixed_layout.html",
+            output_path=out_pdf,
+            max_pages=5,
+            allow_browser=True,
+        )
+        self.assertEqual(pages, 3)
+        reader = PdfReader(str(out_pdf))
+        self.assertEqual(len(reader.pages), 3)
 
 
 if __name__ == "__main__":

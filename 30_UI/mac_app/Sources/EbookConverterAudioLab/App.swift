@@ -2141,7 +2141,7 @@ struct ContentView: View {
     }
 
     @ObservedObject var model: AppModel
-    @State private var destination: Destination? = .urlToPDF
+    @State private var destination: Destination? = .dashboard
     @State private var confirmClearRecentPDFs = false
 
     var body: some View {

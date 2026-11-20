@@ -1,115 +1,133 @@
-# EbookConverter - Multi-Site Ebook to PDF Tool
+# WebTPDF Mac
 
-## 概要
-EbookConverter は、対応する電子書籍ビューアーから高画質な画像を抽出し、精密なクロップ処理を経て、最終的に単一のPDFファイルへと変換するツールです。あわせて、`ebook-convert.js audiobook` から upstream の [DrewThomasson/ebook2audiobook](https://github.com/DrewThomasson/ebook2audiobook) を Docker 経由で起動する headless 導線も用意しています。
+[English](#english) | [日本語](#日本語)
 
-## 🏛 構成
-- **core/**: 共通の画像処理、PDF結合、ブラウザ制御ロジック。
-- **adapters/**: 各書籍サイト固有の操作ロジック。
-- **bin/**: メインの実行コマンド。
-- **scripts/**: PDF / audiobook の補助ランチャー。
-- **40_Ops/output/**: 生成されたPDF / オーディオブックのデフォルト保存先。
+---
 
-## 🚀 実行手順
+<a id="english"></a>
 
-### 1. ブラウザの準備
-変換対象の書籍サイトを Chromium（`--remote-debugging-port=9222`）で開き、ログインを完了させた状態にしてください。
+## English
 
-### 2. PDFへの変換
-標準の CLI を使用して実行します。
+**WebTPDF Mac** is a native macOS (SwiftUI) desktop application for turning web pages into clean PDFs, compressing PDFs, and converting documents into audiobooks locally or via cloud TTS APIs.
 
-```bash
-node 20_Backend/bin/ebook-convert.js --id 1241 --start 1
-```
+### Features
 
-### 3. ローカルEPUB / 画像フォルダの余白カットPDF化
-ローカルにある non-DRM EPUB や、スキャン画像フォルダを直接PDFにできます。外側の白/透明余白は自動で詰めます。
+- **Dashboard**: Check runtime environment readiness at a glance, view recent PDFs, and jump directly to each workflow.
+- **URL → PDF**:
+  - Capture paginated web pages and fixed-layout viewers into a single merged PDF.
+  - Supports authenticated pages via Google Chrome CDP (`--remote-debugging-port=9222`, launchable directly from the app).
+  - Configurable page-turn direction (`←` / `→`), custom save folder, and an **execution queue** with automatic sequential processing and pause/resume controls.
+- **PDF Squeezer (Compression)**:
+  - Compress individual PDFs or entire folders in batch using PyMuPDF.
+  - Three presets: **Light (150 dpi)**, **Balanced (120 dpi)**, and **Strong (96 dpi)**, saving either `*_compressed.pdf` or replacing originals in place.
+- **Audio Lab (Audiobook Conversion)**:
+  - Convert `.pdf`, `.epub`, `.txt`, and `.md` files into `.mp3` or `.m4b` audiobooks.
+  - Supports **macOS `say`**, **Neural `edge-tts`** (free, no API key required), **OpenAI TTS** (`gpt-4o-mini-tts` / `tts-1`), and **ElevenLabs** (`eleven_multilingual_v2`).
+- **PDF Library**: Browse PDFs in a selected folder, open them in Preview/Finder, or send them straight to Audio Lab.
+- **AI Connections & Runtime Setup**:
+  - Manage OpenAI / ElevenLabs TTS API keys and local **Ollama** models.
+  - Built-in diagnostics and one-click install/update buttons for Python packages, Playwright Chromium, `ffmpeg`, and Ollama, plus in-app self-update (`git pull` & rebuild).
 
-```bash
-node 20_Backend/bin/ebook-convert.js local-pdf \
-  --input "/path/to/book.epub" \
-  --output "/path/to/book.pdf"
-```
+### Requirements
 
-見開き画像フォルダは右ページ→左ページの順で1ページずつに分解できます。
+- **macOS 13.0+** with Xcode Command Line Tools (`swiftc`)
+- **Python 3** (`requests`, `beautifulsoup4`, `pypdf`, `pymupdf`, `playwright`, `pillow`, optional `edge-tts`)
+- **Google Chrome** (for CDP authenticated browser capture)
+- **`ffmpeg`** (for MP3/M4B audio encoding)
+- **Ollama** *(optional)* for local LLM management
 
-```bash
-node 20_Backend/bin/ebook-convert.js local-pdf \
-  --input "/path/to/manga_volume" \
-  --output "/path/to/manga_volume.pdf" \
-  --split-spreads auto
-```
-
-- `--split-spreads never|auto|always`: 見開き分割。通常EPUBは `never`、見開き画像フォルダは `auto`。
-- `--page-size 836:1200`: 分割後ページの縦横比。まんが単ページ化では既定値のままでよい。
-- `--skip-blank-threshold 0.025`: 白い誘導ページや空白ページを半ページ単位で除外するしきい値。
-- `--skip-hash <sha256>`: 特定の広告/募集ページなど、完全一致画像を除外したい場合に使う。
-
-### 4. オーディオブック化
-`ebook2audiobook` は別プロジェクトですが、このリポジトリからは `audiobook` サブコマンドで起動できます。内部では `run_ebook2audiobook.py` が Docker を立ち上げます。
+### Quick Start
 
 ```bash
-node 20_Backend/bin/ebook-convert.js audiobook \
-  --ebook "/path/to/book.epub" \
-  --language jpn \
-  --output-format m4b
-```
-
-- `--dry-run` で実際の Docker コマンドを確認できる
-- `--image` で CPU / GPU イメージを切り替えられる
-- デフォルト出力先は `40_Ops/output/audiobooks/`
-- 追加オプションや運用例は `00_Docs/RUNBOOK_ebook2audiobook.md`
-- 音声化対象は non-DRM の合法入手済み電子書籍に限定してください
-- 直接 wrapper を叩く場合は `python3 20_Backend/scripts/run_ebook2audiobook.py ...` を使う
-
-### 5. ブラウザUIで試す
-PDF / EPUB をアップロードして、そのままブラウザで音声再生したいときはローカル UI を使えます。
-
-```bash
-python3 30_UI/audiobook_ui.py
-```
-
-起動後に `http://127.0.0.1:8765` を開き、`mp3` で試すとブラウザ再生しやすくなります。操作の詳細は `00_Docs/RUNBOOK_audiobook_ui.md` を参照してください。
-
-### 6. Macアプリとして起動する
-ネイティブ SwiftUI の `.app` から Audio Lab を起動できます。
-
-```bash
+git clone https://github.com/nanonigit/WebTPDF-Mac.git
+cd WebTPDF-Mac
 zsh 30_UI/mac_app/build_mac_app.sh
 open "40_Ops/apps/WebTPDF Mac.app"
 ```
 
-アプリは Docker Desktop を直接起動し、ログ、出力先、音声再生を画面内で扱います。配布先のMacに Node / Python は不要です。詳細は `00_Docs/RUNBOOK_mac_app.md` を参照してください。
+Once launched, open **System → Runtime** to verify dependencies and install any missing tools with one click.
 
-PDFライブラリの「フォルダーを選択」で表示する場所を変更できます。初期値はDesktopです。ダッシュボードの「最近のPDF」は、行ごとに削除するか「履歴を消去」でまとめて外せます。PDF本体はライブラリに残ります。音声モデルの選択・ダウンロードは音声変換、Ollamaの操作はローカルLLMにあります。ツールバーの「日本語」「English」で直接切り替えられます。
+### Project Structure
 
-**English:** Use **Choose Folder** in **PDF Library** to browse another folder. Remove individual recent entries or use **Clear History** on the dashboard to hide them from the recent list. Your PDF files stay in the library. Audio Lab manages voices and Local LLM manages Ollama models. Select **日本語** or **English** directly in the toolbar.
-
-長いPDFでまず声質だけ確認したい場合は、アプリ内の `短い範囲だけ試す（PDF先頭ページ）` をONにすると、先頭Nページだけの一時PDFを作って変換できます。
-
-人に渡す `.dmg` / `.zip` を作る場合:
-
-```bash
-zsh 30_UI/mac_app/package_mac_app.sh
+```text
+WebTPDF-Mac/
+├── 20_Backend/
+│   └── scripts/
+│       ├── url_pdf_fetcher.py      # URL pagination & fixed-layout PDF capture
+│       ├── pdf_squeezer.py         # PDF image/stream compression
+│       ├── local_audiobook.py      # macOS say / edge-tts / OpenAI / ElevenLabs TTS
+│       └── test_url_pdf_fetcher.py # Unit tests for URL PDF fetcher
+├── 30_UI/
+│   └── mac_app/
+│       ├── Sources/                # SwiftUI macOS app source
+│       ├── Resources/              # App icon assets
+│       ├── build_mac_app.sh        # Build script -> 40_Ops/apps/WebTPDF Mac.app
+│       └── package_mac_app.sh      # Release packaging script (.dmg / .zip)
+└── 40_Ops/
+    └── apps/                       # Built macOS .app bundle output (gitignored)
 ```
 
-成果物は `40_Ops/dist/` に出力されます。
-
-## 📝 開発・運用上の注意
-- **アダプターの追加**: 新しいサイトに対応させる場合は、`adapters/` 配下に対応するアダプターを追加し、`ebook-convert.js` に登録してください。
-- **クロップ設定**: ツールバーの高さなどが特殊な場合は、`core/image_processor.py` の `--top-crop` オプションを調整してください。
-
-## Public release
-
-- `../../PUBLIC_RELEASE_CHECKLIST.md`
-
-## Working principles
-
-- Think before coding
-- Simplicity first
-- Surgical changes
-- Goal-driven execution
-
 ---
-*最終更新: 2026-04-13*
-*責任部門: Development / Research*
+
+<a id="日本語"></a>
+
+## 日本語
+
+**WebTPDF Mac** は、Web ページの PDF 化、PDF の軽量化（圧縮）、および電子書籍・PDF の音声ブック（MP3 / M4B）変換をひとつの画面で行えるネイティブ macOS（SwiftUI）アプリです。
+
+### 主な機能
+
+- **ダッシュボード**: 実行環境の準備状況、最近の PDF 履歴、各機能へのショートカットを一覧表示します。
+- **URL → PDF 作成**:
+  - ページ送り型の Web コンテンツや固定レイアウトビューアーを 1 つの PDF に結合して保存します。
+  - ログインが必要なサイト向けに、アプリ内から起動できる専用 Google Chrome（CDP `--remote-debugging-port=9222`）連携に対応しています。
+  - ページ送り方向（`←` / `→`）の切り替え、保存先フォルダの指定、追加と同時に自動で順番に処理する **実行キュー（一時停止・再開対応）** を備えています。
+- **PDF 圧縮 (Squeezer)**:
+  - PyMuPDF を用いて、単体 PDF またはフォルダ内の全 PDF を一括で軽量化します。
+  - **軽め (150 dpi・高画質)** / **標準 (120 dpi・推奨)** / **強め (96 dpi・最小)** の 3 段階プリセットを選択でき、別名保存（`*_compressed.pdf`）と上書き保存を切り替えられます。
+- **音声変換 (Audio Lab)**:
+  - `.pdf` / `.epub` / `.txt` / `.md` を `.mp3` または `.m4b` 形式のオーディオブックに変換します。
+  - **macOS 標準音声 (`say`)**、**Neural `edge-tts`**（無料・API キー不要）、**OpenAI TTS**（`gpt-4o-mini-tts` / `tts-1`）、**ElevenLabs**（`eleven_multilingual_v2`）に対応しています。
+- **PDF ライブラリ**: 指定フォルダ内の PDF 一覧表示、ファイル起動、Audio Lab への受け渡しができます。
+- **AI 接続 & 実行環境管理**:
+  - OpenAI / ElevenLabs の音声 API キー設定と、ローカル **Ollama** モデルの管理・テストが行えます。
+  - 必要な Python パッケージ・Playwright・`ffmpeg`・Ollama の診断と導入／更新ボタン、およびアプリ自体のワンクリックアップデート機能を備えています。
+
+### 動作要件
+
+- **macOS 13.0 以降**（Xcode Command Line Tools / `swiftc`）
+- **Python 3**（`requests`, `beautifulsoup4`, `pypdf`, `pymupdf`, `playwright`, `pillow`, 任意で `edge-tts`）
+- **Google Chrome**（認証が必要なサイトの CDP 取得用）
+- **`ffmpeg`**（MP3 / M4B 音声エンコード用）
+- **Ollama**（任意：ローカル LLM 連携用）
+
+### クイックスタート
+
+```bash
+git clone https://github.com/nanonigit/WebTPDF-Mac.git
+cd WebTPDF-Mac
+zsh 30_UI/mac_app/build_mac_app.sh
+open "40_Ops/apps/WebTPDF Mac.app"
+```
+
+起動後、左メニューの **「システム」→「実行環境」** から必要なツールが揃っているか確認し、不足があれば画面内のボタンから導入できます。
+
+### ディレクトリ構成
+
+```text
+WebTPDF-Mac/
+├── 20_Backend/
+│   └── scripts/
+│       ├── url_pdf_fetcher.py      # URL ページ送り取得 & PDF 結合
+│       ├── pdf_squeezer.py         # PDF 圧縮スクリプト
+│       ├── local_audiobook.py      # macOS say / edge-tts / OpenAI / ElevenLabs 音声変換
+│       └── test_url_pdf_fetcher.py # URL 取得の単体テスト
+├── 30_UI/
+│   └── mac_app/
+│       ├── Sources/                # SwiftUI macOS アプリ本体
+│       ├── Resources/              # アプリアイコン等
+│       ├── build_mac_app.sh        # .app ビルドスクリプト
+│       └── package_mac_app.sh      # 配布用パッケージ (.dmg / .zip) 作成スクリプト
+└── 40_Ops/
+    └── apps/                       # ビルド済み .app 出力先（Git 管理外）
+```

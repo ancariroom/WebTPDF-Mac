@@ -336,13 +336,14 @@ def inject_print_cleanup(page) -> dict:
                                 }
                             }
                             cur.parentElement.setAttribute('data-ec-pad', cur.parentElement.style.padding || '');
+                            cur.parentElement.style.setProperty('display', 'block', 'important');
                             cur.parentElement.style.setProperty('padding', '0', 'important');
                             cur.parentElement.style.setProperty('margin', '0', 'important');
                             cur.parentElement.style.setProperty('height', 'auto', 'important');
                             cur.parentElement.style.setProperty('min-height', '0', 'important');
                             cur = cur.parentElement;
                         }
-                        return { fixedLayout: true };
+                        return { fixedLayout: true, pfCount: document.querySelectorAll('.pf').length };
                     }
                 }
 
@@ -396,6 +397,7 @@ def remove_print_cleanup(page) -> None:
                 }
                 for (const el of document.querySelectorAll('[data-ec-pad]')) {
                     el.style.padding = el.getAttribute('data-ec-pad');
+                    el.style.removeProperty('display');
                     el.style.removeProperty('margin');
                     el.style.removeProperty('height');
                     el.style.removeProperty('min-height');

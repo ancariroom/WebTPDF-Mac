@@ -515,6 +515,30 @@ def strip_trailing_blank_pages(pdf_bytes: bytes) -> bytes:
     return pdf_bytes
 
 
+def is_pdf_visually_blank(pdf_bytes: bytes) -> bool:
+    """Return True if a captured PDF has zero text/images or renders completely white."""
+    try:
+        import fitz
+
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            if len(doc) == 0:
+                return True
+            for pg in doc:
+                if pg.get_text().strip():
+                    return False
+                if pg.get_images():
+                    pix = pg.get_pixmap(dpi=36, alpha=False)
+                    if pix.samples and min(pix.samples) < 250:
+                        return False
+                else:
+                    pix = pg.get_pixmap(dpi=36, alpha=False)
+                    if pix.samples and min(pix.samples) < 250:
+                        return False
+            return True
+    except Exception:
+        return False
+
+
 def capture_fixed_layout_pf_pages(page, cdp_session=None) -> bytes | None:
     """Capture each .pf fixed-layout page via element screenshot so scaled/absolute layouts never clip."""
     pfs = page.locator(".pf")
@@ -629,10 +653,10 @@ def capture_page_as_pdf_bytes(page, cdp_session=None) -> bytes:
         remove_print_cleanup(page)
 
 
-def wait_for_page_ready(page, timeout_ms: int = 8000) -> None:
+def wait_for_page_ready(page, timeout_ms: int = 12000) -> None:
     """Wait until loading spinners, placeholder text, and pending images finish rendering."""
     try:
-        page.wait_for_load_state("networkidle", timeout=min(2000, timeout_ms))
+        page.wait_for_load_state("networkidle", timeout=min(3000, timeout_ms))
     except Exception:
         pass
 
@@ -676,15 +700,19 @@ def wait_for_page_ready(page, timeout_ms: int = 8000) -> None:
                     }
                 }
 
-                const hasText = bodyText.length > 0;
-                const hasCanvas = Array.from(document.querySelectorAll('canvas')).some(
+                const contentRoot = document.querySelector('#sbo-rt-content, .sbo-reader-content, [data-testid="book-content"], main article, main');
+                const root = contentRoot || document.body;
+                const rootText = (root?.innerText || '').trim();
+                const hasText = rootText.length > 0;
+                const hasCanvas = Array.from((root || document).querySelectorAll('canvas')).some(
                     c => c.width > 0 && c.height > 0
                 );
-                const imgs = Array.from(document.querySelectorAll('img'));
+                const imgs = Array.from((root || document).querySelectorAll('img'));
                 const pendingImg = imgs.some(img => !img.complete);
                 if (pendingImg) return false;
+                const hasVisibleImg = imgs.some(img => img.naturalWidth > 10 && img.naturalHeight > 10);
 
-                return hasText || hasCanvas || imgs.length > 0;
+                return hasText || hasCanvas || hasVisibleImg;
             }""",
             timeout=timeout_ms,
         )
@@ -747,138 +775,162 @@ def fetch_via_browser(
 
         cdp_session = None
         try:
-            cdp_session = context.new_cdp_session(page)
-        except Exception:
-            cdp_session = None
-
-        def handle_response(response) -> None:
             try:
-                ctype = (response.headers.get("content-type") or "").lower()
-                if "application/pdf" in ctype and response.url not in seen_pdf_urls:
-                    body = response.body()
-                    if is_pdf_bytes(body):
-                        seen_pdf_urls.add(response.url)
-                        captured_pdfs.append(body)
-                        log(f"[Browser] Intercepted PDF response: {response.url} ({len(body)} bytes)")
+                cdp_session = context.new_cdp_session(page)
             except Exception:
-                pass
+                cdp_session = None
 
-        page.on("response", handle_response)
-        response_status: int | None = None
-        if created_page or page.url != start_url:
-            log(f"[Browser] Opening {start_url} ...")
-            nav_resp = page.goto(start_url, wait_until="domcontentloaded", timeout=timeout * 1000)
-            response_status = nav_resp.status if nav_resp else None
-        else:
-            log(f"[Browser] Using already-open tab: {page.url}")
-            try:
-                page.bring_to_front()
-            except Exception:
-                pass
+            def handle_response(response) -> None:
+                try:
+                    ctype = (response.headers.get("content-type") or "").lower()
+                    if "application/pdf" in ctype and response.url not in seen_pdf_urls:
+                        body = response.body()
+                        if is_pdf_bytes(body):
+                            seen_pdf_urls.add(response.url)
+                            captured_pdfs.append(body)
+                            log(f"[Browser] Intercepted PDF response: {response.url} ({len(body)} bytes)")
+                except Exception:
+                    pass
 
-        log("[Browser] Waiting for page render...")
-        wait_for_page_ready(page, timeout_ms=8000)
-        check_access_denied(page, response_status)
+            page.on("response", handle_response)
+            response_status: int | None = None
+            if created_page or page.url != start_url:
+                log(f"[Browser] Opening {start_url} ...")
+                nav_resp = page.goto(start_url, wait_until="domcontentloaded", timeout=timeout * 1000)
+                response_status = nav_resp.status if nav_resp else None
+            else:
+                log(f"[Browser] Using already-open tab: {page.url}")
+                try:
+                    page.bring_to_front()
+                except Exception:
+                    pass
 
-        # 1. If a PDF was fetched via XHR/embed during load, merge and return
-        if captured_pdfs:
-            browser.close()
-            return merge_pdf_bytes_list(captured_pdfs, output_path)
+            log("[Browser] Waiting for page render...")
+            wait_for_page_ready(page, timeout_ms=12000)
+            check_access_denied(page, response_status)
 
-        # 2. Check DOM for JS-injected PDF links / iframes
-        html = page.content()
-        dom_pdf_links = extract_pdf_links_from_html(html, page.url)
-        if dom_pdf_links:
-            session = create_session()
-            blobs: list[bytes] = []
-            for link in dom_pdf_links:
-                blob = download_if_pdf(session, link, timeout=timeout)
-                if blob:
-                    blobs.append(blob)
-            if blobs:
-                browser.close()
-                return merge_pdf_bytes_list(blobs, output_path)
+            # 1. If a PDF was fetched via XHR/embed during load, merge and return
+            if captured_pdfs:
+                return merge_pdf_bytes_list(captured_pdfs, output_path)
 
-        # 3. Paginate with ArrowRight / ArrowLeft and capture each page via PDF command
-        turn_key = "ArrowLeft" if direction == "left" else "ArrowRight"
-        if direction == "left":
-            arrow_button_selectors = [
-                "button:has-text('←'):not([disabled])",
-                "a:has-text('←')",
-                "button:has-text('‹'):not([disabled])",
-                "a:has-text('‹')",
-                "[aria-label*='Next' i]:not([disabled])",
-                "[title*='Next' i]:not([disabled])",
-                "button:has-text('次へ'):not([disabled])",
-                "a:has-text('次へ')",
-                "[rel='next']",
-            ]
-        else:
-            arrow_button_selectors = [
-                "button:has-text('→'):not([disabled])",
-                "a:has-text('→')",
-                "button:has-text('›'):not([disabled])",
-                "a:has-text('›')",
-                "[aria-label*='Next' i]:not([disabled])",
-                "[title*='Next' i]:not([disabled])",
-                "button:has-text('次へ'):not([disabled])",
-                "a:has-text('次へ')",
-                "[rel='next']",
-            ]
+            # 2. Check DOM for JS-injected PDF links / iframes
+            html = page.content()
+            dom_pdf_links = extract_pdf_links_from_html(html, page.url)
+            if dom_pdf_links:
+                session = create_session()
+                blobs: list[bytes] = []
+                for link in dom_pdf_links:
+                    blob = download_if_pdf(session, link, timeout=timeout)
+                    if blob:
+                        blobs.append(blob)
+                if blobs:
+                    return merge_pdf_bytes_list(blobs, output_path)
 
-        collected_page_pdfs: list[bytes] = []
-        prev_hash: str | None = None
-        prev_pdf_hash: str | None = None
+            # 3. Paginate with ArrowRight / ArrowLeft and capture each page via PDF command
+            turn_key = "ArrowLeft" if direction == "left" else "ArrowRight"
+            if direction == "left":
+                arrow_button_selectors = [
+                    "button:has-text('←'):not([disabled])",
+                    "a:has-text('←')",
+                    "button:has-text('‹'):not([disabled])",
+                    "a:has-text('‹')",
+                    "[aria-label*='Next' i]:not([disabled])",
+                    "[title*='Next' i]:not([disabled])",
+                    "button:has-text('次へ'):not([disabled])",
+                    "a:has-text('次へ')",
+                    "[rel='next']",
+                ]
+            else:
+                arrow_button_selectors = [
+                    "button:has-text('→'):not([disabled])",
+                    "a:has-text('→')",
+                    "button:has-text('›'):not([disabled])",
+                    "a:has-text('›')",
+                    "[aria-label*='Next' i]:not([disabled])",
+                    "[title*='Next' i]:not([disabled])",
+                    "button:has-text('次へ'):not([disabled])",
+                    "a:has-text('次へ')",
+                    "[rel='next']",
+                ]
 
-        for page_idx in range(1, max_pages + 1):
-            wait_for_page_ready(page, timeout_ms=8000)
-            png_bytes = page.screenshot(full_page=False, timeout=15000)
-            current_hash = hashlib.sha256(png_bytes).hexdigest()
+            collected_page_pdfs: list[bytes] = []
+            prev_hash: str | None = None
+            prev_pdf_hash: str | None = None
 
-            if prev_hash == current_hash:
-                log(f"[Browser] Page {page_idx} identical to previous; stopping pagination.")
-                break
+            for page_idx in range(1, max_pages + 1):
+                wait_for_page_ready(page, timeout_ms=12000)
+                png_bytes = page.screenshot(full_page=False, timeout=15000)
+                current_hash = hashlib.sha256(png_bytes).hexdigest()
 
-            prev_hash = current_hash
-            pdf_count_before = len(captured_pdfs)
-            page_pdf_bytes = capture_page_as_pdf_bytes(page, cdp_session=cdp_session)
-            current_pdf_hash = pdf_content_signature(page_pdf_bytes)
-            if prev_pdf_hash == current_pdf_hash:
-                log(f"[Browser] Page {page_idx} PDF content identical to previous; stopping pagination.")
-                break
-            prev_pdf_hash = current_pdf_hash
-            collected_page_pdfs.append(page_pdf_bytes)
-            log(f"[Browser] Captured page {page_idx} via PDF command ({len(page_pdf_bytes)} bytes)")
+                if prev_hash == current_hash:
+                    log(f"[Browser] Page {page_idx} identical to previous; stopping pagination.")
+                    break
 
-            url_before_turn = page.url
-            # Press ArrowRight or ArrowLeft to advance to the next page
-            page.keyboard.press(turn_key)
-            page.wait_for_timeout(500)
-            wait_for_page_ready(page, timeout_ms=8000)
-
-            # If a PDF response was triggered by the page turn, prefer collected PDFs if complete
-            if len(captured_pdfs) > pdf_count_before:
-                log(f"[Browser] Intercepted PDF response after page turn {page_idx}.")
-
-            # Fallback: if ArrowRight key did not change the URL or view, try clicking a right-arrow / next button
-            after_key_hash = hashlib.sha256(page.screenshot(full_page=False, timeout=15000)).hexdigest()
-            if page.url == url_before_turn and after_key_hash == current_hash:
-                for selector in arrow_button_selectors:
-                    locator = page.locator(selector).first
-                    try:
-                        if locator.count() > 0 and locator.is_visible():
-                            locator.click(timeout=3000)
-                            page.wait_for_timeout(500)
-                            wait_for_page_ready(page, timeout_ms=8000)
+                prev_hash = current_hash
+                pdf_count_before = len(captured_pdfs)
+                page_pdf_bytes = capture_page_as_pdf_bytes(page, cdp_session=cdp_session)
+                if is_pdf_visually_blank(page_pdf_bytes):
+                    for retry in range(2):
+                        log(f"[Browser] Page {page_idx} rendered blank; waiting and retrying ({retry + 1}/2)...")
+                        page.wait_for_timeout(1500)
+                        wait_for_page_ready(page, timeout_ms=10000)
+                        page_pdf_bytes = capture_page_as_pdf_bytes(page, cdp_session=cdp_session)
+                        if not is_pdf_visually_blank(page_pdf_bytes):
                             break
-                    except Exception:
-                        continue
+                    if is_pdf_visually_blank(page_pdf_bytes):
+                        if page_idx == 1:
+                            raise RuntimeError(
+                                "ページの描画が空（白紙）のままだったためPDFを作成できませんでした。"
+                                "ログイン状態やページ読み込みを確認して再実行してください。"
+                            )
+                        log(f"[Browser] Page {page_idx} remained blank after retry; stopping pagination.")
+                        break
+                current_pdf_hash = pdf_content_signature(page_pdf_bytes)
+                if prev_pdf_hash == current_pdf_hash:
+                    log(f"[Browser] Page {page_idx} PDF content identical to previous; stopping pagination.")
+                    break
+                prev_pdf_hash = current_pdf_hash
+                collected_page_pdfs.append(page_pdf_bytes)
+                log(f"[Browser] Captured page {page_idx} via PDF command ({len(page_pdf_bytes)} bytes)")
 
-        if not use_cdp:
-            browser.close()
-        if captured_pdfs and len(captured_pdfs) >= len(collected_page_pdfs):
-            return merge_pdf_bytes_list(captured_pdfs, output_path)
-        return merge_pdf_bytes_list(collected_page_pdfs, output_path)
+                url_before_turn = page.url
+                # Press ArrowRight or ArrowLeft to advance to the next page
+                page.keyboard.press(turn_key)
+                page.wait_for_timeout(500)
+                wait_for_page_ready(page, timeout_ms=8000)
+
+                # If a PDF response was triggered by the page turn, prefer collected PDFs if complete
+                if len(captured_pdfs) > pdf_count_before:
+                    log(f"[Browser] Intercepted PDF response after page turn {page_idx}.")
+
+                # Fallback: if ArrowRight key did not change the URL or view, try clicking a right-arrow / next button
+                after_key_hash = hashlib.sha256(page.screenshot(full_page=False, timeout=15000)).hexdigest()
+                if page.url == url_before_turn and after_key_hash == current_hash:
+                    for selector in arrow_button_selectors:
+                        locator = page.locator(selector).first
+                        try:
+                            if locator.count() > 0 and locator.is_visible():
+                                locator.click(timeout=3000)
+                                page.wait_for_timeout(500)
+                                wait_for_page_ready(page, timeout_ms=8000)
+                                break
+                        except Exception:
+                            continue
+
+            if captured_pdfs and len(captured_pdfs) >= len(collected_page_pdfs):
+                return merge_pdf_bytes_list(captured_pdfs, output_path)
+            return merge_pdf_bytes_list(collected_page_pdfs, output_path)
+        finally:
+            if created_page:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+            if not use_cdp:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
 
 
 def fetch_and_merge(

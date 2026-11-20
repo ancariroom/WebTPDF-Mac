@@ -170,6 +170,12 @@ class UrlPdfFetcherTests(unittest.TestCase):
             """,
             encoding="utf-8",
         )
+        (self.root / "blank_page.html").write_text(
+            """
+            <html><body><header></header><main id="sbo-rt-content"></main></body></html>
+            """,
+            encoding="utf-8",
+        )
         handler = functools.partial(QuietHandler, directory=str(self.root))
         self.httpd = socketserver.TCPServer(("127.0.0.1", 0), handler)
         self.port = self.httpd.server_address[1]
@@ -298,6 +304,17 @@ class UrlPdfFetcherTests(unittest.TestCase):
         self.assertIn("READER_BODY_CONTENT_LINE", text)
         self.assertNotIn("SIDEBAR_EXPLANATION_SHOULD_HIDE", text)
         self.assertNotIn("TOP_BANNER_SHOULD_HIDE", text)
+
+    def test_blank_page_raises_error_instead_of_saving_white_pdf(self) -> None:
+        out_pdf = self.root / "out_blank.pdf"
+        with self.assertRaises(RuntimeError):
+            fetcher.fetch_and_merge(
+                url=f"http://127.0.0.1:{self.port}/blank_page.html",
+                output_path=out_pdf,
+                max_pages=2,
+                allow_browser=True,
+            )
+        self.assertFalse(out_pdf.exists())
 
 
 if __name__ == "__main__":

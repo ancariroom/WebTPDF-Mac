@@ -57,7 +57,7 @@ final class AppModel: ObservableObject {
         var id: String { rawValue }
     }
 
-    enum PageTurnDirection: String, CaseIterable, Identifiable {
+    enum PageTurnDirection: String, CaseIterable, Identifiable, Codable {
         case left
         case right
 
@@ -129,6 +129,16 @@ final class AppModel: ObservableObject {
         var status: Status = .pending
         var outputURL: URL?
         var errorMessage: String?
+    }
+
+    struct URLFetchHistoryItem: Identifiable, Codable, Hashable {
+        let id: UUID
+        let url: String
+        let direction: PageTurnDirection
+        let timestamp: Date
+        let outputPath: String?
+        let succeeded: Bool
+        let errorMessage: String?
     }
 
     struct RuntimeCheckItem: Identifiable {
@@ -203,6 +213,14 @@ final class AppModel: ObservableObject {
     @Published var sourceURLText = ""
     @Published var pageTurnDirection: PageTurnDirection = .right
     @Published var pdfQueue: [PDFQueueItem] = []
+    @Published var urlFetchHistory: [URLFetchHistoryItem] = {
+        guard let data = UserDefaults.standard.data(forKey: "urlFetchHistoryJSON"),
+              let decoded = try? JSONDecoder().decode([URLFetchHistoryItem].self, from: data)
+        else {
+            return []
+        }
+        return decoded
+    }()
     @Published private(set) var isRunningQueue = false
     @Published var isQueueAutoPaused = false
     @Published var squeezerTargetURL: URL?
@@ -644,6 +662,57 @@ final class AppModel: ObservableObject {
         pdfQueue.removeAll { $0.status == .completed || $0.status == .failed }
     }
 
+    func recordURLFetchHistory(
+        url: String,
+        direction: PageTurnDirection,
+        outputURL: URL?,
+        succeeded: Bool,
+        errorMessage: String? = nil
+    ) {
+        let entry = URLFetchHistoryItem(
+            id: UUID(),
+            url: url,
+            direction: direction,
+            timestamp: Date(),
+            outputPath: outputURL?.path,
+            succeeded: succeeded,
+            errorMessage: errorMessage
+        )
+        urlFetchHistory.removeAll { $0.url == url && $0.direction == direction }
+        urlFetchHistory.insert(entry, at: 0)
+        if urlFetchHistory.count > 100 {
+            urlFetchHistory = Array(urlFetchHistory.prefix(100))
+        }
+        saveURLFetchHistory()
+    }
+
+    func redownloadFromHistory(_ item: URLFetchHistoryItem) {
+        pdfQueue.append(PDFQueueItem(url: item.url, direction: item.direction))
+        isQueueAutoPaused = false
+        if !isRunning {
+            statusMessage = t("履歴から再ダウンロードを開始しました", "Started re-download from history")
+            startQueue()
+        } else {
+            statusMessage = t("履歴からキューに追加しました (\(pdfQueue.count)件)", "Added from history to queue (\(pdfQueue.count))")
+        }
+    }
+
+    func removeURLFetchHistoryItem(_ id: UUID) {
+        urlFetchHistory.removeAll { $0.id == id }
+        saveURLFetchHistory()
+    }
+
+    func clearURLFetchHistory() {
+        urlFetchHistory.removeAll()
+        saveURLFetchHistory()
+    }
+
+    private func saveURLFetchHistory() {
+        if let encoded = try? JSONEncoder().encode(urlFetchHistory) {
+            UserDefaults.standard.set(encoded, forKey: "urlFetchHistoryJSON")
+        }
+    }
+
     func retryQueueItem(_ id: UUID) {
         guard let idx = pdfQueue.firstIndex(where: { $0.id == id && $0.status != .running }) else {
             return
@@ -710,6 +779,7 @@ final class AppModel: ObservableObject {
                     self.fetchedPDFURL = mergedURL
                     self.fetchedFromSourceURL = item.url
                     self.outputDirectory = mergedURL.deletingLastPathComponent()
+                    self.recordURLFetchHistory(url: item.url, direction: item.direction, outputURL: mergedURL, succeeded: true)
                     self.appendLog("[Queue #\(processedCount)] Saved -> \(mergedURL.path)\n")
                 } catch {
                     if self.cancelRequested {
@@ -718,6 +788,7 @@ final class AppModel: ObservableObject {
                     }
                     self.pdfQueue[nextIndex].status = .failed
                     self.pdfQueue[nextIndex].errorMessage = error.localizedDescription
+                    self.recordURLFetchHistory(url: item.url, direction: item.direction, outputURL: nil, succeeded: false, errorMessage: error.localizedDescription)
                     self.appendLog("[Queue #\(processedCount)] Failed: \(error.localizedDescription)\n")
                 }
             }
@@ -784,6 +855,7 @@ final class AppModel: ObservableObject {
                 self.progressText = "100%"
                 self.remainingText = "00:00"
                 self.refreshLibraryPDFs()
+                self.recordURLFetchHistory(url: urlString, direction: pageTurnDirection, outputURL: mergedURL, succeeded: true)
                 self.appendLog("\nMerged PDF saved to: \(mergedURL.path)\n")
                 self.startQueueIfAutoRunEnabled()
             } catch {
@@ -792,6 +864,7 @@ final class AppModel: ObservableObject {
                 if self.cancelRequested {
                     self.finishCanceledPreflight()
                 } else {
+                    self.recordURLFetchHistory(url: urlString, direction: self.pageTurnDirection, outputURL: nil, succeeded: false, errorMessage: error.localizedDescription)
                     self.fail(error.localizedDescription)
                 }
                 self.startQueueIfAutoRunEnabled()
@@ -2538,6 +2611,8 @@ struct ContentView: View {
 
                 queueSection
 
+                fetchHistorySection
+
                 GroupBox(model.t("準備状況・保存結果", "Status & Result")) {
                     VStack(spacing: 0) {
                         StatusRow(title: model.t("ステータス", "Status"), value: model.statusMessage, symbol: "info.circle")
@@ -2665,6 +2740,79 @@ struct ContentView: View {
                 }
             }
             .padding(8)
+        }
+    }
+
+    private var fetchHistorySection: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 8) {
+                if model.urlFetchHistory.isEmpty {
+                    Text(model.t("まだURL取得の履歴はありません。", "No URL fetch history yet."))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.vertical, 4)
+                } else {
+                    ForEach(Array(model.urlFetchHistory.prefix(30).enumerated()), id: \.element.id) { idx, entry in
+                        HStack(spacing: 10) {
+                            Image(systemName: entry.succeeded ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                                .foregroundStyle(entry.succeeded ? Color.green : Color.orange)
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(entry.url)
+                                    .font(.caption)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                HStack(spacing: 8) {
+                                    Text(entry.direction.label)
+                                    if let path = entry.outputPath {
+                                        Text(URL(fileURLWithPath: path).lastPathComponent)
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                    } else if let err = entry.errorMessage {
+                                        Text(err)
+                                            .lineLimit(1)
+                                            .truncationMode(.tail)
+                                    }
+                                }
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                            if let path = entry.outputPath, FileManager.default.fileExists(atPath: path) {
+                                Button(model.t("開く", "Open")) {
+                                    NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                                }
+                            }
+
+                            Button(model.t("再ダウンロード", "Re-download")) {
+                                model.redownloadFromHistory(entry)
+                            }
+                            .buttonStyle(.bordered)
+
+                            Button {
+                                model.removeURLFetchHistoryItem(entry.id)
+                            } label: {
+                                Image(systemName: "trash")
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                        if idx < min(model.urlFetchHistory.count, 30) - 1 {
+                            Divider()
+                        }
+                    }
+                }
+            }
+            .padding(8)
+        } label: {
+            HStack {
+                Text(model.t("取得履歴 (\(model.urlFetchHistory.count)件)", "Fetch History (\(model.urlFetchHistory.count))"))
+                Spacer()
+                Button(model.t("履歴を消去", "Clear History")) {
+                    model.clearURLFetchHistory()
+                }
+                .disabled(model.urlFetchHistory.isEmpty)
+            }
         }
     }
 

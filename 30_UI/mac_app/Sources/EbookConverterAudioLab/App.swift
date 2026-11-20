@@ -99,6 +99,22 @@ final class AppModel: ObservableObject {
         }
     }
 
+    enum PDFCompressionPreset: String, CaseIterable, Identifiable {
+        case light
+        case balanced
+        case strong
+
+        var id: String { rawValue }
+
+        func label(_ lang: UILanguage) -> String {
+            switch self {
+            case .light: return lang == .ja ? "軽め (150dpi・高画質)" : "Light (150dpi)"
+            case .balanced: return lang == .ja ? "標準 (120dpi・推奨)" : "Balanced (120dpi)"
+            case .strong: return lang == .ja ? "強め (96dpi・最小)" : "Strong (96dpi)"
+            }
+        }
+    }
+
     struct PDFQueueItem: Identifiable, Hashable {
         enum Status: String {
             case pending
@@ -189,6 +205,9 @@ final class AppModel: ObservableObject {
     @Published var pdfQueue: [PDFQueueItem] = []
     @Published private(set) var isRunningQueue = false
     @Published var isQueueAutoPaused = false
+    @Published var squeezerTargetURL: URL?
+    @Published var squeezerPreset: PDFCompressionPreset = .balanced
+    @Published var squeezerInPlace = false
     @Published var audioEngineMode: AudioEngineMode = .local
     @Published var availableTTSModels: [TTSModelItem] = [
         TTSModelItem(id: "macos:Kyoko", name: "macOS標準: Kyoko (日本語・女性)", engine: "say", voice: "Kyoko", language: "jpn", languages: ["jpn"], installed: true),
@@ -374,6 +393,83 @@ final class AppModel: ObservableObject {
         if let chosen = chooseFile(allowedFileTypes: ["pdf", "epub", "mobi", "azw3"], title: "Choose Ebook") {
             ebookURL = chosen
             fetchedFromSourceURL = nil
+        }
+    }
+
+    func chooseSqueezerPDF() {
+        if let chosen = chooseFile(allowedFileTypes: ["pdf"], title: t("圧縮するPDFを選択", "Choose PDF to Compress")) {
+            squeezerTargetURL = chosen
+        }
+    }
+
+    func chooseSqueezerFolder() {
+        let panel = NSOpenPanel()
+        panel.title = t("一括圧縮するフォルダを選択", "Choose Folder to Compress")
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url {
+            squeezerTargetURL = url
+        }
+    }
+
+    func runPDFSqueezer() {
+        guard let target = squeezerTargetURL else {
+            statusMessage = t("圧縮するPDFまたはフォルダを選択してください。", "Select a PDF file or folder to compress.")
+            return
+        }
+        guard !isRunning else { return }
+        guard let pythonCommand = resolvePythonCommand() else {
+            fail(t("Python 3 が見つかりませんでした。実行環境からセットアップしてください。", "Python 3 not found. Please set it up from Runtime."))
+            return
+        }
+        guard let scriptURL = Bundle.main.url(forResource: "pdf_squeezer", withExtension: "py") else {
+            fail("Bundled script pdf_squeezer.py was not found.")
+            return
+        }
+
+        cancelRequested = false
+        runState = .running
+        statusMessage = t("PDFを圧縮中...", "Compressing PDF(s)...")
+        progressFraction = nil
+        progressText = t("圧縮中", "Compressing")
+        remainingText = "-"
+        logText = "[Squeezer] Target: \(target.path)\n"
+        startProgressClock()
+
+        var args = [
+            scriptURL.path,
+            "--input", target.path,
+            "--preset", squeezerPreset.rawValue,
+        ]
+        if squeezerInPlace {
+            args.append("--in-place")
+        }
+
+        runPythonSubprocess(
+            pythonCommand: pythonCommand,
+            arguments: args,
+            workingDirectory: applicationSupportRoot
+        ) { [weak self] exitCode in
+            guard let self else { return }
+            self.stopProgressClock()
+            if self.cancelRequested {
+                self.runState = .idle
+                self.statusMessage = "Canceled"
+                self.progressText = "-"
+                self.remainingText = "-"
+                return
+            }
+            if exitCode == 0 {
+                self.runState = .completed
+                self.statusMessage = self.t("PDF圧縮が完了しました", "PDF compression completed")
+                self.progressText = "100%"
+                self.remainingText = "00:00"
+                self.refreshLibraryPDFs()
+                self.startQueueIfAutoRunEnabled()
+            } else {
+                self.fail(self.t("PDF圧縮に失敗しました", "PDF compression failed") + " (exit \(exitCode)).")
+            }
         }
     }
 
@@ -2117,6 +2213,7 @@ struct ContentView: View {
         case runtime
         case dashboard
         case urlToPDF
+        case pdfSqueezer
         case audioLab
         case library
         case models
@@ -2130,6 +2227,7 @@ struct ContentView: View {
             case .runtime: return lang == .ja ? "実行環境" : "Runtime"
             case .dashboard: return lang == .ja ? "ダッシュボード" : "Dashboard"
             case .urlToPDF: return lang == .ja ? "URL → PDF 作成" : "URL to PDF"
+            case .pdfSqueezer: return lang == .ja ? "PDF圧縮 (Squeezer)" : "PDF Squeezer"
             case .audioLab: return lang == .ja ? "音声変換 (Audio Lab)" : "Audio Lab"
             case .library: return lang == .ja ? "PDFライブラリ" : "PDF Library"
             case .models: return lang == .ja ? "ローカルLLM" : "Local LLM"
@@ -2143,6 +2241,7 @@ struct ContentView: View {
             case .runtime: return "desktopcomputer"
             case .dashboard: return "square.grid.2x2"
             case .urlToPDF: return "doc.text.magnifyingglass"
+            case .pdfSqueezer: return "arrow.down.right.and.arrow.up.left.circle"
             case .audioLab: return "waveform"
             case .library: return "books.vertical"
             case .models: return "brain"
@@ -2164,6 +2263,8 @@ struct ContentView: View {
                         .tag(Destination.dashboard)
                     Label(Destination.urlToPDF.title(model.uiLanguage), systemImage: Destination.urlToPDF.symbol)
                         .tag(Destination.urlToPDF)
+                    Label(Destination.pdfSqueezer.title(model.uiLanguage), systemImage: Destination.pdfSqueezer.symbol)
+                        .tag(Destination.pdfSqueezer)
                     Label(Destination.audioLab.title(model.uiLanguage), systemImage: Destination.audioLab.symbol)
                         .tag(Destination.audioLab)
                     Label(Destination.library.title(model.uiLanguage), systemImage: Destination.library.symbol)
@@ -2207,6 +2308,8 @@ struct ContentView: View {
                     dashboardView
                 case .urlToPDF:
                     urlToPDFView
+                case .pdfSqueezer:
+                    pdfSqueezerView
                 case .audioLab:
                     audioLabView
                 case .library:
@@ -2879,6 +2982,91 @@ struct ContentView: View {
             .padding(8)
         } label: {
             Text(model.t("実行環境の準備状況", "Runtime Environment"))
+        }
+    }
+
+    private var pdfSqueezerView: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(model.t("PDF圧縮 (Squeezer)", "PDF Squeezer"))
+                        .font(.title2.bold())
+                    Text(model.t("PDF内の画像・ストリームを最適化してファイルサイズを大幅に軽量化します。フォルダごと一括圧縮にも対応しています。", "Optimize embedded images and streams to shrink PDF file sizes. Supports single PDFs or batch folder compression."))
+                        .foregroundStyle(.secondary)
+                }
+
+                GroupBox(model.t("圧縮設定", "Compression Settings")) {
+                    VStack(alignment: .leading, spacing: 14) {
+                        HStack(spacing: 10) {
+                            Text(model.t("対象", "Target"))
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                            Text(model.squeezerTargetURL?.path ?? model.t("未選択", "Not selected"))
+                                .font(.caption)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            Button(model.t("PDFを選択", "Choose PDF")) {
+                                model.chooseSqueezerPDF()
+                            }
+                            .disabled(model.isRunning)
+                            Button(model.t("フォルダ一括", "Choose Folder")) {
+                                model.chooseSqueezerFolder()
+                            }
+                            .disabled(model.isRunning)
+                        }
+
+                        HStack(spacing: 12) {
+                            Text(model.t("圧縮プリセット", "Preset"))
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                            Picker(model.t("圧縮プリセット", "Preset"), selection: $model.squeezerPreset) {
+                                ForEach(AppModel.PDFCompressionPreset.allCases) { preset in
+                                    Text(preset.label(model.uiLanguage)).tag(preset)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                        }
+
+                        Toggle(
+                            model.t("元のファイルを置き換える（オフの場合は _compressed.pdf を作成）", "Overwrite original file(s) (creates _compressed.pdf when off)"),
+                            isOn: $model.squeezerInPlace
+                        )
+                        .disabled(model.isRunning)
+
+                        HStack(spacing: 10) {
+                            Button(model.t("PDFを圧縮", "Compress PDF(s)")) {
+                                model.runPDFSqueezer()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(model.squeezerTargetURL == nil || model.isRunning)
+
+                            if model.isRunning {
+                                Button(model.t("キャンセル", "Cancel"), role: .destructive) {
+                                    model.cancelJob()
+                                }
+                            }
+                        }
+                    }
+                    .padding(8)
+                }
+
+                GroupBox(model.t("進捗・ステータス", "Status")) {
+                    VStack(spacing: 0) {
+                        StatusRow(title: model.t("ステータス", "Status"), value: model.statusMessage, symbol: "info.circle")
+                        Divider()
+                        StatusRow(title: model.t("経過時間", "Elapsed"), value: model.elapsedText, symbol: "clock")
+                    }
+                    if model.isRunning {
+                        ProgressView()
+                            .padding(.top, 8)
+                    }
+                }
+
+                logBox(minHeight: 220)
+            }
+            .padding(28)
         }
     }
 

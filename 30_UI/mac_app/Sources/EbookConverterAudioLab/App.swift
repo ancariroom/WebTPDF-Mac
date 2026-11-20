@@ -115,6 +115,15 @@ final class AppModel: ObservableObject {
         var errorMessage: String?
     }
 
+    struct RuntimeCheckItem: Identifiable {
+        let id: String
+        let name: String
+        let ok: Bool
+        let detail: String
+        let actionTitle: String?
+        let actionShell: String?
+    }
+
     struct TTSModelItem: Identifiable, Decodable, Hashable {
         let id: String
         let name: String
@@ -200,7 +209,7 @@ final class AppModel: ObservableObject {
         }
         return nil
     }()
-    @Published private(set) var runtimeChecks: [(name: String, ok: Bool, detail: String)] = []
+    @Published private(set) var runtimeChecks: [RuntimeCheckItem] = []
     @Published private(set) var libraryPDFs: [URL] = []
     @Published private(set) var libraryFolder = PDFLibraryPreferences().folder
     @Published private(set) var libraryError: String?
@@ -750,14 +759,110 @@ final class AppModel: ObservableObject {
         let sayOk = FileManager.default.isExecutableFile(atPath: "/usr/bin/say")
         let chromeOk = FileManager.default.isExecutableFile(atPath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
         let ollamaPath = resolveOllamaCommand()
+        let ollamaAppExists = FileManager.default.fileExists(atPath: "/Applications/Ollama.app")
+        let brewPath = findExecutable(["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]) ?? "brew"
+        let py = pythonPath ?? "python3"
 
         runtimeChecks = [
-            ("Python 3", pythonPath != nil, pythonPath ?? "未検出"),
-            ("Google Chrome (CDP)", chromeOk, chromeOk ? "利用可能" : "未検出"),
-            ("macOS 音声合成 (say)", sayOk, sayOk ? "/usr/bin/say" : "未検出"),
-            ("ffmpeg (MP3/M4B変換)", ffmpegPath != nil, ffmpegPath ?? "未検出"),
-            ("Ollama (ローカルLLM)", ollamaPath != nil, ollamaStatusMessage),
+            RuntimeCheckItem(
+                id: "python",
+                name: t("Python 3 & 必要パッケージ", "Python 3 & Required Packages"),
+                ok: pythonPath != nil,
+                detail: pythonPath ?? t("未検出", "Not found"),
+                actionTitle: t("導入/更新", "Install/Update"),
+                actionShell: "\"\(py)\" -m pip install --upgrade requests beautifulsoup4 pypdf pymupdf playwright pillow && \"\(py)\" -m playwright install chromium"
+            ),
+            RuntimeCheckItem(
+                id: "chrome",
+                name: "Google Chrome (CDP)",
+                ok: chromeOk,
+                detail: chromeOk ? t("利用可能", "Available") : t("未検出", "Not found"),
+                actionTitle: chromeOk ? t("ログイン用を開く", "Open Browser") : t("導入", "Install"),
+                actionShell: chromeOk ? nil : "\"\(brewPath)\" install --cask google-chrome"
+            ),
+            RuntimeCheckItem(
+                id: "say",
+                name: t("macOS 音声合成 (say)", "macOS Speech (say)"),
+                ok: sayOk,
+                detail: sayOk ? "/usr/bin/say" : t("未検出", "Not found"),
+                actionTitle: nil,
+                actionShell: nil
+            ),
+            RuntimeCheckItem(
+                id: "ffmpeg",
+                name: t("ffmpeg (MP3/M4B変換)", "ffmpeg (MP3/M4B)"),
+                ok: ffmpegPath != nil,
+                detail: ffmpegPath ?? t("未検出", "Not found"),
+                actionTitle: t(ffmpegPath == nil ? "導入" : "更新", ffmpegPath == nil ? "Install" : "Update"),
+                actionShell: ffmpegPath == nil ? "\"\(brewPath)\" install ffmpeg" : "\"\(brewPath)\" upgrade ffmpeg || true"
+            ),
+            RuntimeCheckItem(
+                id: "ollama",
+                name: t("Ollama (ローカルLLM)", "Ollama (Local LLM)"),
+                ok: ollamaPath != nil && !ollamaModels.isEmpty,
+                detail: ollamaStatusMessage,
+                actionTitle: ollamaAppExists ? t("起動", "Launch") : t("導入", "Install"),
+                actionShell: ollamaAppExists
+                    ? "open -a Ollama && sleep 2"
+                    : "\"\(brewPath)\" install --cask ollama && open -a Ollama"
+            ),
         ]
+    }
+
+    func runRuntimeAction(_ item: RuntimeCheckItem) {
+        if item.id == "chrome", item.actionShell == nil {
+            launchLoginBrowser()
+            return
+        }
+        guard let shellCmd = item.actionShell else { return }
+        runMaintenanceShell(title: item.name, shellScript: shellCmd)
+    }
+
+    func installOrUpdateAllDependencies() {
+        let brewPath = findExecutable(["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]) ?? "brew"
+        let py = resolvePythonCommand() ?? "python3"
+        let script = """
+        set -e
+        "\(py)" -m pip install --upgrade requests beautifulsoup4 pypdf pymupdf playwright pillow
+        "\(py)" -m playwright install chromium
+        if command -v "\(brewPath)" >/dev/null 2>&1; then
+          "\(brewPath)" list ffmpeg >/dev/null 2>&1 && "\(brewPath)" upgrade ffmpeg || "\(brewPath)" install ffmpeg || true
+        fi
+        """
+        runMaintenanceShell(title: t("必要パッケージ一括導入/更新", "Install/Update Dependencies"), shellScript: script)
+    }
+
+    private func runMaintenanceShell(title: String, shellScript: String) {
+        guard !isRunning else { return }
+        cancelRequested = false
+        runState = .running
+        statusMessage = "\(title)..."
+        progressFraction = nil
+        progressText = t("実行中", "Running")
+        remainingText = "-"
+        logText = "$ \(shellScript)\n\n"
+        startProgressClock()
+
+        runPythonSubprocess(
+            pythonCommand: "/bin/zsh",
+            arguments: ["-c", shellScript],
+            workingDirectory: applicationSupportRoot
+        ) { [weak self] exitCode in
+            guard let self else { return }
+            self.stopProgressClock()
+            if exitCode == 0 {
+                self.runState = .completed
+                self.statusMessage = "\(title) \(self.t("完了", "Done"))"
+                self.progressText = "100%"
+                self.remainingText = "00:00"
+                self.cachedPythonPath = nil
+                self.refreshTTSModels()
+                self.refreshOllamaModels()
+                self.refreshRuntimeChecks()
+            } else {
+                self.fail("\(title) \(self.t("に失敗しました", "failed")) (exit \(exitCode)).")
+            }
+        }
     }
 
     func resolveRepoRoot() -> URL? {
@@ -2482,8 +2587,8 @@ struct ContentView: View {
 
                 GroupBox("ランタイム診断") {
                     VStack(spacing: 0) {
-                        ForEach(Array(model.runtimeChecks.enumerated()), id: \.offset) { idx, check in
-                            HStack {
+                        ForEach(Array(model.runtimeChecks.enumerated()), id: \.element.id) { idx, check in
+                            HStack(spacing: 10) {
                                 Label(
                                     check.name,
                                     systemImage: check.ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
@@ -2495,6 +2600,12 @@ struct ContentView: View {
                                     .foregroundStyle(.secondary)
                                     .lineLimit(1)
                                     .truncationMode(.middle)
+                                if let actionTitle = check.actionTitle {
+                                    Button(actionTitle) {
+                                        model.runRuntimeAction(check)
+                                    }
+                                    .disabled(model.isRunning)
+                                }
                             }
                             .padding(.vertical, 8)
                             .padding(.horizontal, 4)
@@ -2510,6 +2621,11 @@ struct ContentView: View {
                         model.refreshOllamaModels()
                         model.refreshRuntimeChecks()
                     }
+
+                    Button(model.t("必要ツールを一括更新", "Update Dependencies"), systemImage: "shippingbox") {
+                        model.installOrUpdateAllDependencies()
+                    }
+                    .disabled(model.isRunning)
 
                     Button(model.t("アプリをアップデート", "Update App"), systemImage: "arrow.down.circle") {
                         model.updateAndRelaunchApp()

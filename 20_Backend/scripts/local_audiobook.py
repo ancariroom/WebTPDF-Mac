@@ -27,6 +27,7 @@ CATALOG_MODELS = [
         "engine": "say",
         "voice": "Kyoko",
         "language": "jpn",
+        "languages": ["jpn"],
     },
     {
         "id": "macos:Otoya",
@@ -34,6 +35,7 @@ CATALOG_MODELS = [
         "engine": "say",
         "voice": "Otoya",
         "language": "jpn",
+        "languages": ["jpn"],
     },
     {
         "id": "macos:Samantha",
@@ -41,6 +43,7 @@ CATALOG_MODELS = [
         "engine": "say",
         "voice": "Samantha",
         "language": "eng",
+        "languages": ["eng"],
     },
     {
         "id": "edge:ja-JP-NanamiNeural",
@@ -48,6 +51,7 @@ CATALOG_MODELS = [
         "engine": "edge",
         "voice": "ja-JP-NanamiNeural",
         "language": "jpn",
+        "languages": ["jpn"],
     },
     {
         "id": "edge:ja-JP-KeitaNeural",
@@ -55,6 +59,7 @@ CATALOG_MODELS = [
         "engine": "edge",
         "voice": "ja-JP-KeitaNeural",
         "language": "jpn",
+        "languages": ["jpn"],
     },
     {
         "id": "edge:en-US-JennyNeural",
@@ -62,6 +67,7 @@ CATALOG_MODELS = [
         "engine": "edge",
         "voice": "en-US-JennyNeural",
         "language": "eng",
+        "languages": ["eng"],
     },
     {
         "id": "edge:en-US-AndrewMultilingualNeural",
@@ -69,6 +75,7 @@ CATALOG_MODELS = [
         "engine": "edge",
         "voice": "en-US-AndrewMultilingualNeural",
         "language": "eng",
+        "languages": ["jpn", "eng", "zho", "kor", "fra", "deu", "spa"],
     },
 ]
 
@@ -119,7 +126,8 @@ def list_models_payload() -> list[dict[str, object]]:
                     "name": f"カスタム: {path.name}",
                     "engine": "custom",
                     "voice": str(path),
-                    "language": "multi",
+                    "language": "jpn",
+                    "languages": ["jpn", "eng"],
                     "installed": True,
                 }
             )

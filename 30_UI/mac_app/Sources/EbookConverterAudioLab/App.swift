@@ -121,7 +121,15 @@ final class AppModel: ObservableObject {
         let engine: String
         let voice: String
         let language: String
+        let languages: [String]?
         let installed: Bool
+
+        var supportedLanguages: [String] {
+            if let languages, !languages.isEmpty {
+                return languages
+            }
+            return [language]
+        }
     }
 
     struct OllamaModelInfo: Identifiable, Decodable, Hashable {
@@ -173,8 +181,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var isRunningQueue = false
     @Published var audioEngineMode: AudioEngineMode = .local
     @Published var availableTTSModels: [TTSModelItem] = [
-        TTSModelItem(id: "macos:Kyoko", name: "macOS標準: Kyoko (日本語・女性)", engine: "say", voice: "Kyoko", language: "jpn", installed: true),
-        TTSModelItem(id: "edge:ja-JP-NanamiNeural", name: "Neural: Nanami (日本語・女性・高音質)", engine: "edge", voice: "ja-JP-NanamiNeural", language: "jpn", installed: false),
+        TTSModelItem(id: "macos:Kyoko", name: "macOS標準: Kyoko (日本語・女性)", engine: "say", voice: "Kyoko", language: "jpn", languages: ["jpn"], installed: true),
+        TTSModelItem(id: "edge:ja-JP-NanamiNeural", name: "Neural: Nanami (日本語・女性・高音質)", engine: "edge", voice: "ja-JP-NanamiNeural", language: "jpn", languages: ["jpn"], installed: false),
     ]
     @Published var selectedTTSModelID = "macos:Kyoko"
     @Published var customModelURLText = ""
@@ -297,6 +305,30 @@ final class AppModel: ObservableObject {
 
     func t(_ ja: String, _ en: String) -> String {
         uiLanguage == .ja ? ja : en
+    }
+
+    var availableLanguagesForSelectedModel: [String] {
+        availableTTSModels.first(where: { $0.id == selectedTTSModelID })?.supportedLanguages ?? ["jpn", "eng"]
+    }
+
+    func languageDisplayName(_ code: String) -> String {
+        switch code {
+        case "jpn": return t("日本語 (jpn)", "Japanese (jpn)")
+        case "eng": return t("英語 (eng)", "English (eng)")
+        case "zho": return t("中国語 (zho)", "Chinese (zho)")
+        case "kor": return t("韓国語 (kor)", "Korean (kor)")
+        case "fra": return t("フランス語 (fra)", "French (fra)")
+        case "deu": return t("ドイツ語 (deu)", "German (deu)")
+        case "spa": return t("スペイン語 (spa)", "Spanish (spa)")
+        default: return code
+        }
+    }
+
+    func syncLanguageForSelectedModel() {
+        let supported = availableLanguagesForSelectedModel
+        if !supported.contains(language), let first = supported.first {
+            language = first
+        }
     }
 
     var trimmedSourceURL: String {
@@ -2799,10 +2831,17 @@ struct ContentView: View {
 
     private var languageAndFormatRow: some View {
         HStack(spacing: 12) {
-            TextField("jpn", text: $model.language)
-                .frame(maxWidth: .infinity)
+            Picker(model.t("言語", "Language"), selection: $model.language) {
+                ForEach(model.availableLanguagesForSelectedModel, id: \.self) { code in
+                    Text(model.languageDisplayName(code)).tag(code)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .onChange(of: model.selectedTTSModelID) { _, _ in
+                model.syncLanguageForSelectedModel()
+            }
 
-            Picker("出力形式", selection: $model.outputFormat) {
+            Picker(model.t("出力形式", "Format"), selection: $model.outputFormat) {
                 ForEach(AppModel.OutputFormat.allCases) { format in
                     Text(format.rawValue).tag(format)
                 }

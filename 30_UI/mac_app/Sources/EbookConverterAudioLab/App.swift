@@ -547,6 +547,7 @@ final class AppModel: ObservableObject {
             statusMessage = "ソースURLを入力してください。"
             return
         }
+        sourceURLText = ""
 
         cancelRequested = false
         runState = .running

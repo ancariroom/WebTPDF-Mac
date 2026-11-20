@@ -428,10 +428,19 @@ def pdf_content_signature(pdf_bytes: bytes) -> str:
         import fitz
 
         with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-            parts = [
-                f"{pg.rect.width:.1f}x{pg.rect.height:.1f}|{len(pg.get_images())}|{pg.get_text()}"
-                for pg in doc
-            ]
+            parts: list[str] = []
+            for pg in doc:
+                img_hashes: list[str] = []
+                for img in pg.get_images():
+                    xref = img[0]
+                    try:
+                        img_bytes = doc.extract_image(xref)["image"]
+                        img_hashes.append(hashlib.sha256(img_bytes).hexdigest()[:16])
+                    except Exception:
+                        img_hashes.append(str(xref))
+                parts.append(
+                    f"{pg.rect.width:.1f}x{pg.rect.height:.1f}|{','.join(img_hashes)}|{pg.get_text()}"
+                )
             return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
     except Exception:
         return hashlib.sha256(pdf_bytes).hexdigest()

@@ -188,6 +188,7 @@ final class AppModel: ObservableObject {
     @Published var pageTurnDirection: PageTurnDirection = .right
     @Published var pdfQueue: [PDFQueueItem] = []
     @Published private(set) var isRunningQueue = false
+    @Published var isQueueAutoPaused = false
     @Published var audioEngineMode: AudioEngineMode = .local
     @Published var availableTTSModels: [TTSModelItem] = [
         TTSModelItem(id: "macos:Kyoko", name: "macOS標準: Kyoko (日本語・女性)", engine: "say", voice: "Kyoko", language: "jpn", languages: ["jpn"], installed: true),
@@ -485,7 +486,31 @@ final class AppModel: ObservableObject {
 
         pdfQueue.append(PDFQueueItem(url: urlString, direction: pageTurnDirection))
         sourceURLText = ""
-        statusMessage = t("キューに追加しました (\(pdfQueue.count)件)", "Added to queue (\(pdfQueue.count))")
+        isQueueAutoPaused = false
+        if !isRunning {
+            statusMessage = t("キューに追加し、自動実行を開始しました (\(pdfQueue.count)件)", "Added to queue and started auto-run (\(pdfQueue.count))")
+            startQueue()
+        } else {
+            statusMessage = t("キューに追加しました (\(pdfQueue.count)件)", "Added to queue (\(pdfQueue.count))")
+        }
+    }
+
+    func pauseQueueAutoRun() {
+        isQueueAutoPaused = true
+        if isRunningQueue {
+            statusMessage = t("現在の項目が完了したら自動実行を一時停止します", "Will pause auto-run after current item finishes")
+        } else {
+            statusMessage = t("自動実行を一時停止しました", "Queue auto-run paused")
+        }
+    }
+
+    func resumeQueueAutoRun() {
+        isQueueAutoPaused = false
+        if hasPendingQueueItems && !isRunning {
+            startQueue()
+        } else {
+            statusMessage = t("自動実行を再開しました", "Queue auto-run resumed")
+        }
     }
 
     func removeQueueItem(_ id: UUID) {
@@ -523,6 +548,7 @@ final class AppModel: ObservableObject {
         guard hasPendingQueueItems, !isRunning else { return }
 
         cancelRequested = false
+        isQueueAutoPaused = false
         isRunningQueue = true
         runState = .running
         progressFraction = nil
@@ -536,6 +562,7 @@ final class AppModel: ObservableObject {
             var processedCount = 0
 
             while !self.cancelRequested,
+                  !self.isQueueAutoPaused,
                   let nextIndex = self.pdfQueue.firstIndex(where: { $0.status == .pending }) {
                 processedCount += 1
                 let item = self.pdfQueue[nextIndex]
@@ -574,6 +601,11 @@ final class AppModel: ObservableObject {
             if self.cancelRequested {
                 self.runState = .idle
                 self.statusMessage = "Canceled"
+            } else if self.isQueueAutoPaused && self.hasPendingQueueItems {
+                self.runState = .idle
+                let remaining = self.pdfQueue.filter { $0.status == .pending }.count
+                self.statusMessage = self.t("自動実行を一時停止しました（残り\(remaining)件）", "Queue paused (\(remaining) pending)")
+                self.progressText = self.t("一時停止", "Paused")
             } else {
                 self.runState = .completed
                 self.statusMessage = self.t("キュー実行完了 (\(processedCount)件処理)", "Queue completed (\(processedCount) item(s))")
@@ -2422,10 +2454,21 @@ struct ContentView: View {
                     }
 
                     HStack(spacing: 10) {
+                        if model.isQueueAutoPaused {
+                            Button(model.t("自動実行を再開", "Resume Auto-Run")) {
+                                model.resumeQueueAutoRun()
+                            }
+                            .buttonStyle(.borderedProminent)
+                        } else {
+                            Button(model.t("自動実行を一時停止", "Pause Auto-Run")) {
+                                model.pauseQueueAutoRun()
+                            }
+                            .buttonStyle(.bordered)
+                        }
+
                         Button(model.t("キューを連続実行", "Run Queue")) {
                             model.startQueue()
                         }
-                        .buttonStyle(.borderedProminent)
                         .disabled(!model.hasPendingQueueItems || model.isRunning)
 
                         Button(model.t("失敗分を再実行", "Retry Failed")) {
@@ -2439,6 +2482,10 @@ struct ContentView: View {
                         .disabled(model.isRunning)
 
                         Spacer()
+
+                        Text(model.isQueueAutoPaused ? model.t("自動実行: 一時停止中", "Auto-Run: Paused") : model.t("自動実行: オン", "Auto-Run: ON"))
+                            .font(.caption)
+                            .foregroundStyle(model.isQueueAutoPaused ? .orange : .green)
                     }
                     .padding(.top, 4)
                 }

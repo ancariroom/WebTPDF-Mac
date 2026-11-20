@@ -256,6 +256,19 @@ class UrlPdfFetcherTests(unittest.TestCase):
         reader = PdfReader(str(out_pdf))
         self.assertEqual(len(reader.pages), 3)
 
+    def test_pdf_content_signature_distinguishes_image_pdfs(self) -> None:
+        from PIL import Image
+
+        def make_image_pdf(color: tuple[int, int, int]) -> bytes:
+            buf = io.BytesIO()
+            img = Image.new("RGB", (200, 300), color=color)
+            img.save(buf, "PDF")
+            return buf.getvalue()
+
+        sig_red = fetcher.pdf_content_signature(make_image_pdf((255, 0, 0)))
+        sig_blue = fetcher.pdf_content_signature(make_image_pdf((0, 0, 255)))
+        self.assertNotEqual(sig_red, sig_blue)
+
 
 if __name__ == "__main__":
     unittest.main()

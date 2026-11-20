@@ -769,8 +769,17 @@ final class AppModel: ObservableObject {
         let chromeOk = FileManager.default.isExecutableFile(atPath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
         let ollamaPath = resolveOllamaCommand()
         let ollamaAppExists = FileManager.default.fileExists(atPath: "/Applications/Ollama.app")
+        let ollamaInstalled = (ollamaPath != nil) || ollamaAppExists
         let brewPath = findExecutable(["/opt/homebrew/bin/brew", "/usr/local/bin/brew"])
         let py = pythonPath ?? "python3"
+        let brewCmd = brewPath ?? "brew"
+        let ollamaStartCmd = ollamaAppExists
+            ? "open -a Ollama"
+            : "nohup \"\(ollamaPath ?? "ollama")\" serve >/tmp/webtpdf_ollama.log 2>&1 &"
+        let ollamaWaitCmd = "for i in {1..16}; do curl -sf http://127.0.0.1:11434/api/tags >/dev/null && break; sleep 0.5; done"
+        let ollamaActionShell = ollamaInstalled
+            ? "\(ollamaStartCmd) && \(ollamaWaitCmd)"
+            : "\"\(brewCmd)\" install ollama && nohup \"$(\"\(brewCmd)\" --prefix)/bin/ollama\" serve >/tmp/webtpdf_ollama.log 2>&1 & \(ollamaWaitCmd)"
 
         let ffmpegInstallShell = """
         if [ -x /opt/homebrew/bin/brew ] || [ -x /usr/local/bin/brew ]; then
@@ -826,10 +835,8 @@ final class AppModel: ObservableObject {
                 name: t("Ollama (ローカルLLM)", "Ollama (Local LLM)"),
                 ok: ollamaReachable,
                 detail: ollamaStatusMessage,
-                actionTitle: ollamaAppExists ? t("起動", "Launch") : t("導入", "Install"),
-                actionShell: ollamaAppExists
-                    ? "open -a Ollama && for i in {1..10}; do curl -sf http://127.0.0.1:11434/api/tags >/dev/null && break; sleep 0.5; done"
-                    : "\"\(brewPath ?? "brew")\" install --cask ollama && open -a Ollama && for i in {1..10}; do curl -sf http://127.0.0.1:11434/api/tags >/dev/null && break; sleep 0.5; done"
+                actionTitle: ollamaInstalled ? t("起動", "Launch") : t("導入", "Install"),
+                actionShell: ollamaActionShell
             ),
         ]
     }
@@ -852,6 +859,17 @@ final class AppModel: ObservableObject {
         "\(py)" -m playwright install chromium
         if command -v "\(brewPath)" >/dev/null 2>&1; then
           "\(brewPath)" list ffmpeg >/dev/null 2>&1 && "\(brewPath)" upgrade ffmpeg || "\(brewPath)" install ffmpeg || true
+          if ! curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+            if ! command -v ollama >/dev/null 2>&1; then
+              "\(brewPath)" install ollama || true
+            fi
+            if [ -d "/Applications/Ollama.app" ]; then
+              open -a Ollama
+            elif command -v ollama >/dev/null 2>&1; then
+              nohup ollama serve >/tmp/webtpdf_ollama.log 2>&1 &
+            fi
+            for i in {1..16}; do curl -sf http://127.0.0.1:11434/api/tags >/dev/null && break; sleep 0.5; done
+          fi
         fi
         """
         runMaintenanceShell(title: t("必要パッケージ一括導入/更新", "Install/Update Dependencies"), shellScript: script)

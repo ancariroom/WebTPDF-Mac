@@ -283,12 +283,69 @@ def resolve_cdp_url(candidates: tuple[str, ...] = (
 PRINT_CLEANUP_STYLE_ID = "__ebookconverter_print_cleanup__"
 
 
-def inject_print_cleanup(page) -> None:
-    """Temporarily normalize sticky/fixed headers and overflow clipping for clean multi-page PDF printing."""
+def inject_print_cleanup(page) -> dict:
+    """Temporarily normalize page layout for clean multi-page or fixed-layout (.pf) PDF printing."""
     try:
-        page.evaluate(
+        result = page.evaluate(
             """(styleId) => {
-                if (document.getElementById(styleId)) return;
+                if (document.getElementById(styleId)) return { fixedLayout: false };
+
+                const pf = document.querySelector('.pf');
+                if (pf) {
+                    const st = window.getComputedStyle(pf);
+                    const w = Math.ceil(parseFloat(st.width) || pf.offsetWidth);
+                    const h = Math.ceil(parseFloat(st.height) || pf.offsetHeight);
+                    if (w > 100 && h > 100) {
+                        const style = document.createElement('style');
+                        style.id = styleId;
+                        style.textContent = `
+                            @page { size: ${w}px ${h + 2}px !important; margin: 0 !important; }
+                            @media print {
+                                html, body {
+                                    width: ${w}px !important; height: auto !important; min-height: 0 !important;
+                                    margin: 0 !important; padding: 0 !important;
+                                    background: #fff !important; overflow: visible !important;
+                                }
+                                header, nav, footer { display: none !important; }
+                                #sbo-rt-content, #pdf-main, .pdf-page {
+                                    margin: 0 !important; padding: 0 !important;
+                                    transform: none !important; width: ${w}px !important;
+                                    max-width: ${w}px !important; min-width: 0 !important;
+                                    height: auto !important; min-height: 0 !important;
+                                    position: static !important; left: 0 !important; top: 0 !important;
+                                }
+                                .pdf-page {
+                                    height: ${h}px !important; overflow: hidden !important;
+                                    break-after: page !important; page-break-after: always !important;
+                                    break-inside: avoid !important; page-break-inside: avoid !important;
+                                }
+                                .pf {
+                                    margin: 0 !important; border: none !important; box-shadow: none !important;
+                                }
+                            }
+                        `;
+                        document.head.appendChild(style);
+
+                        const rt = document.querySelector('#sbo-rt-content') || document.querySelector('#pdf-main') || pf.parentElement;
+                        let cur = rt;
+                        while (cur && cur.parentElement && cur.parentElement !== document.body) {
+                            for (const sib of cur.parentElement.children) {
+                                if (sib !== cur && sib.tagName !== 'STYLE' && sib.tagName !== 'SCRIPT') {
+                                    sib.setAttribute('data-ec-hide', sib.style.display || '');
+                                    sib.style.setProperty('display', 'none', 'important');
+                                }
+                            }
+                            cur.parentElement.setAttribute('data-ec-pad', cur.parentElement.style.padding || '');
+                            cur.parentElement.style.setProperty('padding', '0', 'important');
+                            cur.parentElement.style.setProperty('margin', '0', 'important');
+                            cur.parentElement.style.setProperty('height', 'auto', 'important');
+                            cur.parentElement.style.setProperty('min-height', '0', 'important');
+                            cur = cur.parentElement;
+                        }
+                        return { fixedLayout: true };
+                    }
+                }
+
                 const style = document.createElement('style');
                 style.id = styleId;
                 style.textContent = `
@@ -318,11 +375,13 @@ def inject_print_cleanup(page) -> None:
                         el.style.setProperty('position', 'static', 'important');
                     }
                 }
+                return { fixedLayout: false };
             }""",
             PRINT_CLEANUP_STYLE_ID,
         )
+        return result if isinstance(result, dict) else {"fixedLayout": False}
     except Exception:
-        pass
+        return {"fixedLayout": False}
 
 
 def remove_print_cleanup(page) -> None:
@@ -331,6 +390,17 @@ def remove_print_cleanup(page) -> None:
         page.evaluate(
             """(styleId) => {
                 document.getElementById(styleId)?.remove();
+                for (const el of document.querySelectorAll('[data-ec-hide]')) {
+                    el.style.display = el.getAttribute('data-ec-hide');
+                    el.removeAttribute('data-ec-hide');
+                }
+                for (const el of document.querySelectorAll('[data-ec-pad]')) {
+                    el.style.padding = el.getAttribute('data-ec-pad');
+                    el.style.removeProperty('margin');
+                    el.style.removeProperty('height');
+                    el.style.removeProperty('min-height');
+                    el.removeAttribute('data-ec-pad');
+                }
                 for (const el of document.querySelectorAll('[data-ec-orig-pos]')) {
                     const orig = el.getAttribute('data-ec-orig-pos');
                     if (orig) {
@@ -347,37 +417,90 @@ def remove_print_cleanup(page) -> None:
         pass
 
 
+def pdf_content_signature(pdf_bytes: bytes) -> str:
+    """Return a deterministic content signature for a PDF ignoring metadata timestamps."""
+    try:
+        import fitz
+
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            parts = [
+                f"{pg.rect.width:.1f}x{pg.rect.height:.1f}|{len(pg.get_images())}|{pg.get_text()}"
+                for pg in doc
+            ]
+            return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+    except Exception:
+        return hashlib.sha256(pdf_bytes).hexdigest()
+
+
+def strip_trailing_blank_pages(pdf_bytes: bytes) -> bytes:
+    """Remove trailing completely blank pages produced by CSS page-break-after."""
+    try:
+        import fitz
+
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            if len(doc) <= 1:
+                return pdf_bytes
+            last_non_blank = len(doc) - 1
+            while last_non_blank > 0:
+                pg = doc[last_non_blank]
+                if pg.get_text().strip() or pg.get_images() or pg.get_drawings():
+                    break
+                last_non_blank -= 1
+            if last_non_blank < len(doc) - 1:
+                doc.delete_pages(from_page=last_non_blank + 1, to_page=len(doc) - 1)
+                return doc.tobytes()
+    except Exception:
+        pass
+    return pdf_bytes
+
+
 def capture_page_as_pdf_bytes(page, cdp_session=None) -> bytes:
     """Capture the current Playwright page as PDF bytes via printToPDF or screenshot fallback."""
-    inject_print_cleanup(page)
+    cleanup_info = inject_print_cleanup(page)
+    fixed_layout = bool(cleanup_info.get("fixedLayout"))
+    cdp_params = (
+        {
+            "printBackground": True,
+            "preferCSSPageSize": True,
+            "marginTop": 0,
+            "marginBottom": 0,
+            "marginLeft": 0,
+            "marginRight": 0,
+        }
+        if fixed_layout
+        else {
+            "printBackground": True,
+            "preferCSSPageSize": False,
+            "marginTop": 0.5,
+            "marginBottom": 0.5,
+            "marginLeft": 0.4,
+            "marginRight": 0.4,
+        }
+    )
+
     try:
         if cdp_session is not None:
             try:
                 import base64
 
-                result = cdp_session.send(
-                    "Page.printToPDF",
-                    {
-                        "printBackground": True,
-                        "preferCSSPageSize": False,
-                        "marginTop": 0.5,
-                        "marginBottom": 0.5,
-                        "marginLeft": 0.4,
-                        "marginRight": 0.4,
-                    },
-                )
+                result = cdp_session.send("Page.printToPDF", cdp_params)
                 data = base64.b64decode(result["data"])
                 if is_pdf_bytes(data):
-                    return data
+                    return strip_trailing_blank_pages(data) if fixed_layout else data
             except Exception:
                 pass
 
         try:
-            return page.pdf(
+            data = page.pdf(
                 print_background=True,
-                prefer_css_page_size=False,
-                margin={"top": "0.5in", "bottom": "0.5in", "left": "0.4in", "right": "0.4in"},
+                prefer_css_page_size=fixed_layout,
+                margin=(
+                    {"top": "0", "bottom": "0", "left": "0", "right": "0"}
+                    if fixed_layout
+                    else {"top": "0.5in", "bottom": "0.5in", "left": "0.4in", "right": "0.4in"}
+                ),
             )
+            return strip_trailing_blank_pages(data) if fixed_layout else data
         except Exception:
             png_bytes = page.screenshot(full_page=False)
             buf = io.BytesIO()
@@ -587,6 +710,7 @@ def fetch_via_browser(
 
         collected_page_pdfs: list[bytes] = []
         prev_hash: str | None = None
+        prev_pdf_hash: str | None = None
 
         for page_idx in range(1, max_pages + 1):
             wait_for_page_ready(page, timeout_ms=8000)
@@ -600,6 +724,11 @@ def fetch_via_browser(
             prev_hash = current_hash
             pdf_count_before = len(captured_pdfs)
             page_pdf_bytes = capture_page_as_pdf_bytes(page, cdp_session=cdp_session)
+            current_pdf_hash = pdf_content_signature(page_pdf_bytes)
+            if prev_pdf_hash == current_pdf_hash:
+                log(f"[Browser] Page {page_idx} PDF content identical to previous; stopping pagination.")
+                break
+            prev_pdf_hash = current_pdf_hash
             collected_page_pdfs.append(page_pdf_bytes)
             log(f"[Browser] Captured page {page_idx} via PDF command ({len(page_pdf_bytes)} bytes)")
 

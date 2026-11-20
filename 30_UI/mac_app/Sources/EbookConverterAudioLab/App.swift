@@ -971,7 +971,7 @@ final class AppModel: ObservableObject {
             ),
             RuntimeCheckItem(
                 id: "ollama",
-                name: t("Ollama (ローカルLLM)", "Ollama (Local LLM)"),
+                name: t("Ollama (AI接続)", "Ollama (AI Connection)"),
                 ok: ollamaReachable,
                 detail: ollamaStatusMessage,
                 actionTitle: ollamaInstalled ? t("起動", "Launch") : t("導入", "Install"),
@@ -2230,7 +2230,7 @@ struct ContentView: View {
             case .pdfSqueezer: return lang == .ja ? "PDF圧縮 (Squeezer)" : "PDF Squeezer"
             case .audioLab: return lang == .ja ? "音声変換 (Audio Lab)" : "Audio Lab"
             case .library: return lang == .ja ? "PDFライブラリ" : "PDF Library"
-            case .models: return lang == .ja ? "ローカルLLM" : "Local LLM"
+            case .models: return lang == .ja ? "AI接続" : "AI Connection"
             case .logs: return lang == .ja ? "ログ" : "Logs"
             case .settings: return lang == .ja ? "システム設定" : "Settings"
             }
@@ -2693,7 +2693,7 @@ struct ContentView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text(model.t("ローカルLLMの管理", "Manage Local LLMs"))
+                    Text(model.t("AI接続の管理", "Manage AI Connections"))
                         .font(.title2.bold())
                     Text(model.t("Ollamaの言語モデルを選択・ダウンロードし、推論を確認できます。", "Select and download Ollama language models, and test inference."))
                         .foregroundStyle(.secondary)
@@ -2859,7 +2859,7 @@ struct ContentView: View {
                     Image(systemName: "chevron.right").foregroundStyle(.secondary)
                     topologyCard("音声エンジン", symbol: "waveform", detail: model.audioEngineMode.label)
                     Image(systemName: "chevron.right").foregroundStyle(.secondary)
-                    topologyCard("ローカルLLM", symbol: "brain", detail: "\(model.ollamaModels.count)件")
+                    topologyCard(model.t("AI接続", "AI Connection"), symbol: "brain", detail: "\(model.ollamaModels.count)件")
                 }
                 .padding(20)
                 .frame(maxWidth: .infinity)
@@ -2869,7 +2869,7 @@ struct ContentView: View {
                     Button("URL → PDF 作成を開く") { destination = .urlToPDF }
                         .buttonStyle(.borderedProminent)
                     Button("音声変換を開く") { destination = .audioLab }
-                    Button(model.t("ローカルLLMを開く", "Open Local LLM")) { destination = .models }
+                    Button(model.t("AI接続を開く", "Open AI Connection")) { destination = .models }
                 }
 
                 dashboardRuntimeBox

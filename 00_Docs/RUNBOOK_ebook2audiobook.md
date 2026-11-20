@@ -12,7 +12,7 @@ EbookConverter からは `node 20_Backend/bin/ebook-convert.js audiobook ...` �
 - 変換したい本が `.epub` / `.mobi` / `.pdf` など upstream が対応する形式であること
 
 ## 既定の保存先
-- 出力: `Company/05_Products/EbookConverter/40_Ops/output/audiobooks/`
+- 出力: `40_Ops/output/audiobooks/`
 - モデルキャッシュ: `~/.cache/ebookconverter/ebook2audiobook/models/`
 - 音声サンプルキャッシュ: `~/.cache/ebookconverter/ebook2audiobook/voices/`
 - 一時ディレクトリ: `~/.cache/ebookconverter/ebook2audiobook/tmp/`

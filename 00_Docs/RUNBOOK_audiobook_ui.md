@@ -6,7 +6,7 @@
 ## 起動
 
 ```bash
-cd /Users/naoki/Git/Company/05_Products/EbookConverter
+cd /path/to/WebTPDF-Mac
 python3 30_UI/audiobook_ui.py
 ```
 

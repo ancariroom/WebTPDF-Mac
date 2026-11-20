@@ -6,7 +6,7 @@
 ## ビルド
 
 ```bash
-cd /Users/naoki/Git/Company/05_Products/EbookConverter
+cd /path/to/WebTPDF-Mac
 zsh 30_UI/mac_app/build_mac_app.sh
 ```
 
@@ -33,7 +33,7 @@ open "40_Ops/apps/EbookConverter Audio Lab.app"
 ## 配布パッケージ作成
 
 ```bash
-cd /Users/naoki/Git/Company/05_Products/EbookConverter
+cd /path/to/WebTPDF-Mac
 zsh 30_UI/mac_app/package_mac_app.sh
 ```
 

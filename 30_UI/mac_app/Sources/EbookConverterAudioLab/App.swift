@@ -323,6 +323,10 @@ final class AppModel: ObservableObject {
         pdfQueue.contains(where: { $0.status == .pending })
     }
 
+    var hasFailedQueueItems: Bool {
+        pdfQueue.contains(where: { $0.status == .failed })
+    }
+
     func chooseEbook() {
         if let chosen = chooseFile(allowedFileTypes: ["pdf", "epub", "mobi", "azw3"], title: "Choose Ebook") {
             ebookURL = chosen
@@ -448,6 +452,29 @@ final class AppModel: ObservableObject {
 
     func clearFinishedQueueItems() {
         pdfQueue.removeAll { $0.status == .completed || $0.status == .failed }
+    }
+
+    func retryQueueItem(_ id: UUID) {
+        guard let idx = pdfQueue.firstIndex(where: { $0.id == id && $0.status != .running }) else {
+            return
+        }
+        pdfQueue[idx].status = .pending
+        pdfQueue[idx].errorMessage = nil
+        if !isRunning {
+            startQueue()
+        }
+    }
+
+    func retryFailedQueueItems() {
+        var resetCount = 0
+        for idx in pdfQueue.indices where pdfQueue[idx].status == .failed {
+            pdfQueue[idx].status = .pending
+            pdfQueue[idx].errorMessage = nil
+            resetCount += 1
+        }
+        if resetCount > 0 && !isRunning {
+            startQueue()
+        }
     }
 
     func startQueue() {
@@ -2155,6 +2182,16 @@ struct ContentView: View {
                                 }
                             }
 
+                            if item.status == .failed || item.status == .completed {
+                                Button {
+                                    model.retryQueueItem(item.id)
+                                } label: {
+                                    Image(systemName: "arrow.clockwise")
+                                }
+                                .buttonStyle(.borderless)
+                                .help(model.t("このURLを再実行", "Retry this URL"))
+                            }
+
                             Button {
                                 model.removeQueueItem(item.id)
                             } label: {
@@ -2174,6 +2211,11 @@ struct ContentView: View {
                         }
                         .buttonStyle(.borderedProminent)
                         .disabled(!model.hasPendingQueueItems || model.isRunning)
+
+                        Button(model.t("失敗分を再実行", "Retry Failed")) {
+                            model.retryFailedQueueItems()
+                        }
+                        .disabled(!model.hasFailedQueueItems || model.isRunning)
 
                         Button(model.t("完了済みを整理", "Clear Finished")) {
                             model.clearFinishedQueueItems()

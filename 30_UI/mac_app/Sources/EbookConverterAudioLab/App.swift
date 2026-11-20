@@ -1374,14 +1374,48 @@ final class AppModel: ObservableObject {
         ])
     }
 
+    private var cachedPythonPath: String?
+
     private func resolvePythonCommand() -> String? {
+        if let cachedPythonPath, FileManager.default.isExecutableFile(atPath: cachedPythonPath) {
+            return cachedPythonPath
+        }
+
         let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
-        return findExecutable([
+        var candidates: [String] = []
+
+        let pyenvVersionsDir = URL(fileURLWithPath: home, isDirectory: true)
+            .appendingPathComponent(".pyenv/versions", isDirectory: true)
+        if let versions = try? FileManager.default.contentsOfDirectory(atPath: pyenvVersionsDir.path) {
+            for version in versions.sorted(by: { $0.compare($1, options: .numeric) == .orderedDescending }) {
+                candidates.append(pyenvVersionsDir.appendingPathComponent("\(version)/bin/python3").path)
+            }
+        }
+
+        candidates += [
             "\(home)/.pyenv/shims/python3",
             "/opt/homebrew/bin/python3",
             "/usr/local/bin/python3",
             "/usr/bin/python3",
-        ])
+        ]
+
+        // Prefer a Python interpreter that has the required PDF/scraping modules installed
+        for candidate in candidates where FileManager.default.isExecutableFile(atPath: candidate) {
+            let probe = Process()
+            probe.executableURL = URL(fileURLWithPath: candidate)
+            probe.arguments = ["-c", "import requests, bs4, pypdf, fitz, playwright, PIL"]
+            probe.standardOutput = Pipe()
+            probe.standardError = Pipe()
+            if (try? probe.run()) != nil {
+                probe.waitUntilExit()
+                if probe.terminationStatus == 0 {
+                    cachedPythonPath = candidate
+                    return candidate
+                }
+            }
+        }
+
+        return findExecutable(candidates)
     }
 
     private func resolveURLFetcherScript() -> URL? {

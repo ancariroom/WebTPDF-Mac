@@ -368,8 +368,6 @@ def inject_print_cleanup(page) -> dict:
                         }
                         header, nav, footer, aside,
                         [role="complementary"], [role="navigation"], [role="banner"],
-                        [class*="sidebar" i], [class*="drawer" i],
-                        [class*="sidePanel" i], [class*="side-panel" i],
                         [class*="other-formats" i] {
                             display: none !important;
                         }
@@ -383,7 +381,7 @@ def inject_print_cleanup(page) -> dict:
                 `;
                 document.head.appendChild(style);
 
-                const rt = document.querySelector('#sbo-rt-content, .sbo-reader-content, [data-testid="book-content"], main article, main');
+                const rt = document.querySelector('#sbo-rt-content, .sbo-reader-content, [data-testid="book-content"], [class*="_contentContainer_"], main article, main');
                 if (rt && ((rt.innerText || '').trim().length > 0 || rt.querySelector('img, canvas, svg'))) {
                     let cur = rt;
                     while (cur && cur.parentElement && cur.parentElement !== document.body) {

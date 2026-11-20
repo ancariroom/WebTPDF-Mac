@@ -161,8 +161,10 @@ class UrlPdfFetcherTests(unittest.TestCase):
               <header>TOP_BANNER_SHOULD_HIDE</header>
               <div style="display:flex;">
                 <main id="sbo-rt-content" style="width:300px;">
-                  <h1>Main Chapter Title</h1>
-                  <p>READER_BODY_CONTENT_LINE</p>
+                  <section class="_contentContainer_test _sidebarIsOpen_test">
+                    <h1>Main Chapter Title</h1>
+                    <p>READER_BODY_CONTENT_LINE</p>
+                  </section>
                 </main>
                 <aside class="sidebar">SIDEBAR_EXPLANATION_SHOULD_HIDE</aside>
               </div>

@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
-from PIL import Image
+from PIL import Image, ImageChops, ImageStat
 from pypdf import PdfReader, PdfWriter
 
 USER_AGENT = (
@@ -1048,17 +1048,42 @@ KINDLE_GO_TO_PAGE = re.compile(r"^(?:Go to Page|ページ[へに]移動)$", re.I
 KINDLE_GO_TO_LOCATION = re.compile(r"^(?:Go to Location|位置(?:番号)?[へに]移動)$", re.IGNORECASE)
 
 
+def kindle_number_fields(panel):
+    field = panel.locator("input[type=number], input[placeholder='location' i], input[placeholder='page' i]").filter(visible=True)
+    go = panel.get_by_text(re.compile(r"^(?:Go|移動)$", re.I), exact=True).filter(visible=True)
+    if field.count() == 1 and go.count() == 1:
+        return field, go
+    return None
+
+
 def open_kindle_number_dialog(page, prefer_page: bool):
-    """Prefer the reader's direct page field when it is available."""
+    # The Ionic reader has an explicit modal. Its Go control is an ion-button host.
+    live_panel = page.locator("ion-modal.go-to-modal").filter(visible=True).first
+    if live_panel.is_visible():
+        controls = kindle_number_fields(live_panel)
+        if controls:
+            kind = "page" if live_panel.get_by_text(KINDLE_GO_TO_PAGE, exact=True).first.is_visible() else "location"
+            return kind, live_panel, *controls
+
     location = page.get_by_text(KINDLE_GO_TO_LOCATION, exact=True).filter(visible=True).first
     printed_page = page.get_by_text(KINDLE_GO_TO_PAGE, exact=True).filter(visible=True).first
     available = printed_page.or_(location) if prefer_page else location
     if not available.first.is_visible():
         menu_name = re.compile(
-            r"^(?:More(?: options| menu| actions| settings)?|Menu|Options|その他(?:のオプション)?|詳細(?:設定)?|メニュー|⋮)$",
+            r"^(?:More(?: options| menu| actions| settings)?|Reader menu|Menu|Options|その他(?:のオプション)?|詳細(?:設定)?|メニュー|⋮)$",
             re.I,
         )
-        menus = page.get_by_role("button", name=menu_name).or_(
+        reader_menu = page.locator("ion-button[aria-label='Reader menu'], #reader-header [aria-label='メニュー']").filter(visible=True)
+        if not reader_menu.count() and urlparse(page.url).hostname in KINDLE_READER_HOSTS:
+            # The top bar is actually removed until the reader canvas is tapped.
+            box = _find_kindle_page_box(page)
+            if box is not None:
+                page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                try:
+                    reader_menu.first.wait_for(state="visible", timeout=2000)
+                except Exception:
+                    pass
+        menus = reader_menu.or_(page.get_by_role("button", name=menu_name)).or_(
             page.locator(
                 "#kr-more, #kr-more-menu, #kr-more-menu-button, #kr-more-settings, "
                 "[data-testid='more-button'], button[aria-haspopup='menu'], [role='button'][aria-haspopup='menu']"
@@ -1084,25 +1109,32 @@ def open_kindle_number_dialog(page, prefer_page: bool):
     else:
         return None
     entry.click(timeout=2000)
+    if live_panel.is_visible():
+        controls = kindle_number_fields(live_panel)
+        if controls:
+            return kind, live_panel, *controls
     heading = page.get_by_text(label, exact=True).filter(visible=True).last
     heading.wait_for(state="visible", timeout=2000)
     panel = heading.locator("xpath=..")
     for _ in range(4):
         if panel.evaluate("node => node === document.body || node === document.documentElement"):
             break
-        field = panel.locator("input[type=number], input[placeholder='location' i], input[placeholder='page' i]").filter(visible=True)
-        go = panel.get_by_role("button", name=re.compile(r"^(?:Go|移動)$", re.I)).filter(visible=True)
-        if field.count() == 1 and go.count() == 1:
-            return kind, panel, field, go
+        controls = kindle_number_fields(panel)
+        if controls:
+            return kind, panel, *controls
         panel = panel.locator("xpath=..")
     page.keyboard.press("Escape")
     return None
 
 
-def seek_kindle_position(page, target: int, target_is_printed_page: bool) -> bool:
+def seek_kindle_position(
+    page, target: int, target_is_printed_page: bool, expected_total_pages: int | None = None,
+) -> bool:
     """Navigate by number first; the caller still verifies the saved screenshot."""
     low, high = 1, None
-    for _ in range(13 if target_is_printed_page else 1):
+    next_probe = None
+    locations_per_page = None
+    for attempt in range(13 if target_is_printed_page else 1):
         before = get_kindle_position(page)
         dialog = open_kindle_number_dialog(page, prefer_page=target_is_printed_page)
         if dialog is None:
@@ -1113,7 +1145,7 @@ def seek_kindle_position(page, target: int, target_is_printed_page: bool) -> boo
             same_position = before == (kind, target)
             if kind == "page" or not target_is_printed_page:
                 number = target
-            elif before and before[0] == "page":
+            elif (before and before[0] == "page") or expected_total_pages:
                 # The input is in locations even though the checkpoint stores a printed page.
                 # Re-enter the location shown for this page when we are already on the label.
                 label = panel.inner_text(timeout=1500)
@@ -1131,9 +1163,13 @@ def seek_kindle_position(page, target: int, target_is_printed_page: bool) -> boo
                             log("[Kindle] The maximum location number is unavailable.")
                             return False
                         high = int(maximum)
+                        if expected_total_pages and expected_total_pages > 0:
+                            locations_per_page = high / expected_total_pages
+                            next_probe = round((target - 1) * locations_per_page)
                     if low > high:
                         return False
-                    number = (low + high) // 2
+                    midpoint = (low + high) // 2
+                    number = next_probe if next_probe is not None and low <= next_probe <= high else midpoint
             else:
                 log("[Kindle] The reader has no printed page label to compare with the saved page.")
                 return False
@@ -1145,7 +1181,7 @@ def seek_kindle_position(page, target: int, target_is_printed_page: bool) -> boo
             field.wait_for(state="hidden", timeout=2000)
         finally:
             if field.is_visible():
-                cancel = panel.get_by_role("button", name=re.compile(r"^(?:Cancel|キャンセル)$", re.I)).first
+                cancel = panel.get_by_text(re.compile(r"^(?:Cancel|キャンセル)$", re.I), exact=True).filter(visible=True).first
                 if cancel.is_visible():
                     cancel.click(timeout=1500)
 
@@ -1158,6 +1194,12 @@ def seek_kindle_position(page, target: int, target_is_printed_page: bool) -> boo
         if kind == "page" or not target_is_printed_page or same_position:
             return True
         if actual is None or actual[0] != "page":
+            # The cover can report Location only. The first probe seeks into
+            # the body where printed page labels are usually available.
+            if attempt == 0 and locations_per_page and high is not None:
+                next_probe = min(high, number + max(1, round(locations_per_page * 3)))
+                if next_probe != number:
+                    continue
             return False
         if abs(actual[1] - target) <= 1:
             return True
@@ -1165,6 +1207,9 @@ def seek_kindle_position(page, target: int, target_is_printed_page: bool) -> boo
             low = number + 1
         else:
             high = number - 1
+        next_probe = None
+        if locations_per_page and attempt < 2:
+            next_probe = number + round((target - actual[1]) * locations_per_page)
     return False
 
 
@@ -1212,6 +1257,41 @@ def reopen_kindle_from_library(page, start_url: str, book_title: str | None) -> 
     return True
 
 
+def matches_saved_kindle_image(screenshot: bytes, saved_pdf: bytes) -> bool:
+    """Compare a clipped view to the single embedded image in its checkpoint PDF."""
+    import pymupdf
+
+    try:
+        with Image.open(io.BytesIO(screenshot)) as current, pymupdf.open(
+            stream=saved_pdf, filetype="pdf"
+        ) as doc:
+            images = doc[0].get_images()
+            if len(doc) != 1 or len(images) != 1:
+                return False
+            saved_image = doc.extract_image(images[0][0])["image"]
+            with Image.open(io.BytesIO(saved_image)) as saved:
+                w, h = current.size
+                pad_x, pad_y = max(24, round(w * 0.07)), max(32, round(h * 0.07))
+                if saved.size != (w + 2 * pad_x, h + 2 * pad_y):
+                    return False
+                saved = saved.crop((pad_x, pad_y, pad_x + w, pad_y + h))
+                size = (128, 128)
+                difference = ImageChops.difference(
+                    current.convert("L").resize(size), saved.convert("L").resize(size),
+                )
+                if ImageStat.Stat(difference).mean[0] > 0.45:
+                    return False
+                # A local change (such as a different paragraph) can disappear
+                # in an average over a mostly empty page.
+                for y in range(0, 128, 16):
+                    for x in range(0, 128, 16):
+                        if ImageStat.Stat(difference.crop((x, y, x + 16, y + 16))).mean[0] > 1.6:
+                            return False
+                return True
+    except Exception:
+        return False
+
+
 def recover_kindle_oops(
     page,
     start_url: str,
@@ -1224,6 +1304,7 @@ def recover_kindle_oops(
     fresh_tab: bool = False,
     use_location: bool = False,
     expected_total_pages: int | None = None,
+    last_pdf: bytes | None = None,
 ) -> bool:
     """Reopen the book and resume after the last verified capture."""
     try:
@@ -1249,7 +1330,9 @@ def recover_kindle_oops(
         if use_location and last_kindle_page is not None and last_image_hash is not None:
             try:
                 log("[Kindle] Trying number navigation before page turns or table of contents...")
-                seek_kindle_position(page, last_kindle_page, expected_total_pages is not None)
+                seek_kindle_position(
+                    page, last_kindle_page, expected_total_pages is not None, expected_total_pages,
+                )
             except Exception as exc:
                 log(f"[Kindle] Go to Location unavailable ({type(exc).__name__}).")
                 page.keyboard.press("Escape")
@@ -1275,6 +1358,8 @@ def recover_kindle_oops(
             rewind_kindle_to_start(page, turn_key)
         reverse_key = "ArrowRight" if turn_key == "ArrowLeft" else "ArrowLeft"
         expected_position_kind = "page" if expected_total_pages is not None else None
+        previous_direction = None
+        reversals = 0
         for _ in range(max(captured_count + 20, 40)):
             if is_kindle_oops(page):
                 return False
@@ -1285,9 +1370,18 @@ def recover_kindle_oops(
                 return False
             if last_image_hash is not None:
                 box = _find_kindle_page_box(page)
-                matches_image = box is not None and hashlib.sha256(
-                    page.screenshot(clip=box, timeout=5000)
-                ).hexdigest() == last_image_hash
+                matches_image = False
+                if box is not None:
+                    frame = page.screenshot(clip=box, timeout=5000)
+                    matches_image = hashlib.sha256(frame).hexdigest() == last_image_hash
+                    if (
+                        not matches_image and last_pdf is not None
+                        and marker is not None and marker[0] == expected_position_kind
+                        and position == last_kindle_page
+                    ):
+                        matches_image = matches_saved_kindle_image(frame, last_pdf)
+                        if matches_image:
+                            log("[Kindle] Verified the saved page by matching its image.")
             else:
                 # Reflowable layouts can lack a clipped page image.
                 matches_image = last_kindle_page is not None and position == last_kindle_page
@@ -1299,7 +1393,14 @@ def recover_kindle_oops(
                     return True
                 return False
             backwards = last_kindle_page is not None and position is not None and position > last_kindle_page
-            page.keyboard.press(reverse_key if backwards else turn_key)
+            direction = reverse_key if backwards else turn_key
+            if previous_direction is not None and direction != previous_direction:
+                reversals += 1
+                if reversals > 1:
+                    log("[Kindle] Stopped seeking after crossing the saved page without verifying its image.")
+                    return False
+            previous_direction = direction
+            page.keyboard.press(direction)
             if not wait_for_kindle_turn(page, source):
                 return False
         log("[Kindle] Could not verify the last captured page after reopening.")
@@ -1809,6 +1910,7 @@ def fetch_via_browser(
                             book_title=book_title,
                             use_location=recovery_attempts < 4,
                             expected_total_pages=expected_total_pages,
+                            last_pdf=collected_page_pdfs[-1] if collected_page_pdfs else None,
                         )
                         if recovery_attempts == 1:
                             recovered = recover_kindle_oops(

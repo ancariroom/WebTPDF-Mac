@@ -388,14 +388,42 @@ class UrlPdfFetcherTests(unittest.TestCase):
                 self.assertGreater(len(entered), 1)
                 self.assertNotIn(24, entered)
 
+                # The live reader's cover shows Location even when the saved
+                # checkpoint is a printed page. The first probe reveals pages.
+                page.locator("p").evaluate("(footer) => footer.textContent = 'Location 4 of 499 ● 0%'")
+                self.assertTrue(fetcher.seek_kindle_position(page, 24, True, 50))
+                self.assertEqual(fetcher.get_kindle_position(page), ("page", 24))
+                entered = page.evaluate("window.visitedLocations")
+                self.assertGreater(entered[-1], 24)
+
                 # Typing is still attempted if a reopen already shows the saved
                 # page number. The direct page field wins when both are offered.
                 page.evaluate("window.pageMenuAvailable = true")
+                position = 24
                 self.assertTrue(fetcher.seek_kindle_position(page, position, target_is_printed_page=True))
                 self.assertEqual(page.evaluate("window.visitedPages"), [position])
                 self.assertEqual(page.evaluate("window.visitedLocations"), entered)
             finally:
                 browser.close()
+
+    def test_kindle_checkpoint_image_tolerates_encoding_but_rejects_other_content(self) -> None:
+        from PIL import Image, ImageDraw
+
+        image = Image.new("RGB", (400, 600), "white")
+        draw = ImageDraw.Draw(image)
+        for y in range(120, 440, 24):
+            draw.rectangle((50, y, 310, y + 8), fill="black")
+        padded = Image.new("RGB", (456, 684), "white")
+        padded.paste(image, (28, 42))
+        checkpoint = io.BytesIO()
+        padded.save(checkpoint, "PDF")
+        frame = io.BytesIO()
+        image.save(frame, "PNG")
+        self.assertTrue(fetcher.matches_saved_kindle_image(frame.getvalue(), checkpoint.getvalue()))
+        draw.rectangle((50, 455, 290, 470), fill="black")
+        different = io.BytesIO()
+        image.save(different, "PNG")
+        self.assertFalse(fetcher.matches_saved_kindle_image(different.getvalue(), checkpoint.getvalue()))
 
     def test_kindle_library_reopens_unique_exact_title(self) -> None:
         from playwright.sync_api import sync_playwright

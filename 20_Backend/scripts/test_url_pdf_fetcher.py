@@ -524,10 +524,19 @@ class UrlPdfFetcherTests(unittest.TestCase):
         frame = io.BytesIO()
         image.save(frame, "PNG")
         self.assertTrue(fetcher.matches_saved_kindle_image(frame.getvalue(), checkpoint.getvalue()))
+        slightly_darker = io.BytesIO()
+        Image.eval(image, lambda value: max(0, value - 1)).save(slightly_darker, "PNG")
+        self.assertFalse(fetcher.matches_saved_kindle_image(slightly_darker.getvalue(), checkpoint.getvalue()))
+        self.assertTrue(fetcher.matches_saved_kindle_image(
+            slightly_darker.getvalue(), checkpoint.getvalue(), same_printed_page=True,
+        ))
         draw.rectangle((50, 455, 290, 470), fill="black")
         different = io.BytesIO()
         image.save(different, "PNG")
         self.assertFalse(fetcher.matches_saved_kindle_image(different.getvalue(), checkpoint.getvalue()))
+        self.assertFalse(fetcher.matches_saved_kindle_image(
+            different.getvalue(), checkpoint.getvalue(), same_printed_page=True,
+        ))
 
     def test_kindle_library_reopens_unique_exact_title(self) -> None:
         from playwright.sync_api import sync_playwright

@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
-from PIL import Image, ImageChops, ImageStat
+from PIL import Image, ImageChops, ImageOps, ImageStat
 from pypdf import PdfReader, PdfWriter
 
 USER_AGENT = (
@@ -1209,6 +1209,14 @@ def seek_kindle_position(
         if not changed and (not same_position or is_kindle_oops(page)):
             return False
         actual = get_kindle_position(page)
+        if kind == "page":
+            deadline = time.monotonic() + 4
+            while not actual or actual[0] != "page" or abs(actual[1] - number) > 1:
+                if time.monotonic() >= deadline or is_kindle_oops(page):
+                    log(f"[Kindle] The page field did not settle near {number}.")
+                    return False
+                page.wait_for_timeout(250)
+                actual = get_kindle_position(page)
         if actual:
             log(f"[Kindle] Number navigation reached {actual[0]} {actual[1]}.")
         if kind == "page" or not target_is_printed_page or same_position:
@@ -1277,7 +1285,7 @@ def reopen_kindle_from_library(page, start_url: str, book_title: str | None) -> 
     return True
 
 
-def matches_saved_kindle_image(screenshot: bytes, saved_pdf: bytes) -> bool:
+def matches_saved_kindle_image(screenshot: bytes, saved_pdf: bytes, *, same_printed_page: bool = False) -> bool:
     """Compare a clipped view to the single embedded image in its checkpoint PDF."""
     import pymupdf
 
@@ -1296,16 +1304,21 @@ def matches_saved_kindle_image(screenshot: bytes, saved_pdf: bytes) -> bool:
                     return False
                 saved = saved.crop((pad_x, pad_y, pad_x + w, pad_y + h))
                 size = (128, 128)
-                difference = ImageChops.difference(
-                    current.convert("L").resize(size), saved.convert("L").resize(size),
-                )
-                if ImageStat.Stat(difference).mean[0] > 0.45:
+                current_luma, saved_luma = current.convert("L").resize(size), saved.convert("L").resize(size)
+                if same_printed_page:
+                    current_median, saved_median = (ImageStat.Stat(img).median[0] for img in (current_luma, saved_luma))
+                    if min(current_median, saved_median) < 48 and max(current_median, saved_median) > 207:
+                        current_luma = ImageOps.invert(current_luma)
+                difference = ImageChops.difference(current_luma, saved_luma)
+                max_mean = 1.8 if same_printed_page else 0.45
+                max_tile_mean = 5.5 if same_printed_page else 1.6
+                if ImageStat.Stat(difference).mean[0] > max_mean:
                     return False
                 # A local change (such as a different paragraph) can disappear
                 # in an average over a mostly empty page.
                 for y in range(0, 128, 16):
                     for x in range(0, 128, 16):
-                        if ImageStat.Stat(difference.crop((x, y, x + 16, y + 16))).mean[0] > 1.6:
+                        if ImageStat.Stat(difference.crop((x, y, x + 16, y + 16))).mean[0] > max_tile_mean:
                             return False
                 return True
     except Exception:
@@ -1765,61 +1778,84 @@ def kindle_frame_matches(page, saved: KindleCapture) -> bool:
     frame = page.screenshot(clip=box, timeout=5000)
     return (
         hashlib.sha256(frame).hexdigest() == saved.image_hash
-        or matches_saved_kindle_image(frame, saved.pdf)
+        or matches_saved_kindle_image(frame, saved.pdf, same_printed_page=True)
     )
 
 
-def verify_kindle_gap(page, left: KindleCapture, right: KindleCapture, turn_key: str) -> bytes | None:
-    """Verify both saved images and return the PDF pages from the views between them."""
-    if not left.image_hash or not right.image_hash or left.position is None or right.position is None:
-        return None
-    reverse_key = "ArrowRight" if turn_key == "ArrowLeft" else "ArrowLeft"
-    position = get_kindle_position(page)
-    if position is None or position[0] != "page" or abs(position[1] - left.position) > 5:
-        seek_kindle_position(page, left.position, True, left.total)
-
-    step = None
-    for _ in range(9):
-        if kindle_frame_matches(page, left):
-            break
-        position = get_kindle_position(page)
-        if position is None or position[0] != "page" or position[1] == left.position:
-            return None
-        direction = reverse_key if position[1] > left.position else turn_key
-        if step is not None and step != direction:
-            return None
-        step = direction
-        source = page.evaluate(KINDLE_PAGE_SOURCE)
-        page.keyboard.press(direction)
-        if not wait_for_kindle_turn(page, source):
-            return None
-        page.wait_for_timeout(200)
-    else:
+def follow_kindle_gap(page, start: KindleCapture, end: KindleCapture, key: str, sign: int) -> list[bytes] | None:
+    """Follow one direction between two independently matched images."""
+    if start.position is None or end.position is None:
         return None
 
-    writer = PdfWriter()
-    previous = left.position
-    for _ in range(min(40, right.position - left.position + 4)):
+    def advance() -> bool:
         source = page.evaluate(KINDLE_PAGE_SOURCE)
-        page.keyboard.press(turn_key)
+        page.keyboard.press(key)
         if not wait_for_kindle_turn(page, source):
+            return False
+        page.wait_for_timeout(280)
+        return not is_kindle_oops(page)
+
+    current = get_kindle_position(page)
+    if not kindle_frame_matches(page, start):
+        if not current or current[0] != "page" or not 1 <= (start.position - current[1]) * sign <= 5:
+            target = max(1, min(start.total or start.position, start.position - sign))
+            if not seek_kindle_position(page, target, True, start.total):
+                return None
+        for _ in range(8):
+            if kindle_frame_matches(page, start):
+                break
+            marker = get_kindle_position(page)
+            if not marker or marker[0] != "page" or (marker[1] - start.position) * sign > 0:
+                return None
+            if not advance():
+                return None
+        else:
             return None
-        page.wait_for_timeout(200)
-        if kindle_frame_matches(page, right):
-            if not writer.pages:
-                return b""
-            buffer = io.BytesIO()
-            writer.write(buffer)
-            return buffer.getvalue()
+
+    frames = []
+    previous = start.position
+    seen = {start.image_hash}
+    for _ in range(min(40, abs(end.position - start.position) + 6)):
+        if not advance():
+            return None
+        if kindle_frame_matches(page, end):
+            return frames if sign > 0 else frames[::-1]
         marker = get_kindle_position(page)
-        if not marker or marker[0] != "page" or not previous < marker[1] < right.position:
+        if not marker or marker[0] != "page" or not (
+            (marker[1] - previous) * sign >= 0 and (end.position - marker[1]) * sign >= 0
+        ):
             return None
         screenshot = capture_kindle_page_as_pdf_bytes(page)
         if screenshot is None or is_kindle_oops(page):
             return None
-        writer.append(io.BytesIO(screenshot[0]))
+        pdf, png = screenshot
+        digest = hashlib.sha256(png).hexdigest()
+        if digest in seen:
+            return None
+        seen.add(digest)
+        frames.append(pdf)
         previous = marker[1]
     return None
+
+
+def verify_kindle_gap(page, left: KindleCapture, right: KindleCapture, turn_key: str) -> bytes | None:
+    """Verify both saved images and return the PDF pages seen between them."""
+    if not left.image_hash or not right.image_hash:
+        return None
+    frames = follow_kindle_gap(page, left, right, turn_key, 1)
+    if frames is None and not is_kindle_oops(page):
+        reverse_key = "ArrowRight" if turn_key == "ArrowLeft" else "ArrowLeft"
+        frames = follow_kindle_gap(page, right, left, reverse_key, -1)
+    if frames is None:
+        return None
+    if not frames:
+        return b""
+    writer = PdfWriter()
+    for pdf in frames:
+        writer.append(io.BytesIO(pdf))
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
 
 
 def verify_merged_kindle_pdf(pdfs: list[bytes], output: Path, count: int) -> None:
@@ -1885,6 +1921,7 @@ def finish_kindle_at_end(
                             log(f"[Kindle] Interval {left.position}–{right.position}: {type(exc).__name__}")
                             repaired = None
                         if repaired is None:
+                            log(f"[Kindle] Could not verify the saved views for {left.position}–{right.position}.")
                             if is_kindle_oops(page):
                                 page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
                                 if not _wait_for_kindle_reader(page):

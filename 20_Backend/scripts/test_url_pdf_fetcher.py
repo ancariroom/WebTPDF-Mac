@@ -301,9 +301,12 @@ class UrlPdfFetcherTests(unittest.TestCase):
             args[args.index("--max-pages") + 1] = "28"
             with patch.object(sys, "argv", args), patch.object(
                 fetcher, "jump_to_kindle_chapter", wraps=fetcher.jump_to_kindle_chapter
-            ) as jump:
+            ) as jump, patch.object(fetcher, "recover_kindle_oops", wraps=fetcher.recover_kindle_oops) as recover:
                 self.assertEqual(fetcher.main(), 0)
                 self.assertEqual(jump.call_args.args[1], 1)
+                same_tab = recover.call_args_list[0].args[0]
+                self.assertTrue(recover.call_args.kwargs["fresh_tab"])
+                self.assertIsNot(recover.call_args.args[0], same_tab)
             status = json.loads(report.read_text(encoding="utf-8"))
 
         self.assertEqual((status["pageCount"], status["expectedPages"]), (28, 28))
@@ -313,6 +316,98 @@ class UrlPdfFetcherTests(unittest.TestCase):
             for number, page in enumerate(pdf, 1):
                 pixels = page.get_pixmap()
                 self.assertAlmostEqual(pixels.pixel(pixels.width // 2, pixels.height // 2)[0], number * 8, delta=3)
+
+    def test_kindle_go_to_location_uses_the_rendered_page_to_seek(self) -> None:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.set_content("""
+                    <button id="more" aria-label="More options">⋮</button>
+                    <button id="location-menu" hidden>Go to Location</button>
+                    <section id="dialog" hidden>
+                      <h2>Go to Location</h2>
+                      <label>Go to location <input type="number" placeholder="location"> of 499</label>
+                      <button id="go">Go</button>
+                      <button id="cancel">Cancel</button>
+                    </section>
+                    <img width="180" height="180"><p></p>
+                    <script>
+                      const byId = (id) => document.getElementById(id);
+                      const input = document.querySelector('input');
+                      const image = document.querySelector('img');
+                      window.visitedLocations = [];
+                      function render(position) {
+                        const canvas = document.createElement('canvas');
+                        canvas.toBlob((blob) => {
+                          image.src = URL.createObjectURL(blob);
+                          document.querySelector('p').textContent =
+                            'Page ' + (1 + Math.floor(position / 10)) + ' of 50';
+                        });
+                      }
+                      byId('more').onclick = () => byId('location-menu').hidden = false;
+                      byId('location-menu').onclick = () => {
+                        byId('location-menu').hidden = true;
+                        byId('dialog').hidden = false;
+                      };
+                      byId('go').onclick = () => {
+                        const position = Number(input.value);
+                        window.visitedLocations.push(position);
+                        byId('dialog').hidden = true;
+                        render(position);
+                      };
+                      byId('cancel').onclick = () => byId('dialog').hidden = true;
+                      render(10);
+                    </script>
+                """)
+                page.get_by_text("Page 2 of 50", exact=True).wait_for()
+                fetcher.seek_kindle_position(page, 24, target_is_printed_page=True)
+                kind, position = fetcher.get_kindle_position(page)
+                self.assertEqual(kind, "page")
+                self.assertLessEqual(abs(position - 24), 1)
+                entered = page.evaluate("window.visitedLocations")
+                self.assertGreater(len(entered), 1)
+                self.assertNotIn(24, entered)
+            finally:
+                browser.close()
+
+    def test_kindle_library_reopens_unique_exact_title(self) -> None:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.route("https://read.amazon.co.jp/**", lambda route: route.fulfill(
+                    content_type="text/html",
+                    body="""
+                        <button id="back">Back to Library</button>
+                        <button hidden id="other">Example Book, second edition</button>
+                        <button hidden id="book">Example Book</button>
+                        <script>
+                          back.onclick = () => {
+                            back.hidden = true;
+                            book.hidden = false;
+                            other.hidden = false;
+                          };
+                          book.onclick = () => {
+                            const image = new Image(180, 180);
+                            const canvas = document.createElement('canvas');
+                            canvas.toBlob(blob => {
+                              image.src = URL.createObjectURL(blob);
+                              document.body.append(image);
+                            });
+                          };
+                        </script>
+                    """,
+                ))
+                url = "https://read.amazon.co.jp/?asin=TEST"
+                page.goto(url)
+                self.assertTrue(fetcher.reopen_kindle_from_library(page, url, "Example Book"))
+            finally:
+                browser.close()
 
     def test_canceled_kindle_capture_reports_saved_progress(self) -> None:
         output = self.root / "canceled.pdf"

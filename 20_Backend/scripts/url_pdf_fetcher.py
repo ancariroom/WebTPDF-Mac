@@ -698,25 +698,27 @@ def is_kindle_oops(page) -> bool:
         return False
 
 
-def get_kindle_page_number(page) -> int | None:
-    """Extract current page or location number from Kindle Cloud Reader footer."""
+def get_kindle_position(page) -> tuple[str, int] | None:
+    """Read the footer's printed Page or Kindle Location and keep the units distinct."""
     try:
-        body_text = page.inner_text("body") or ""
-        m = re.search(r"Page\s+(\d+)\s+of\s+\d+", body_text, re.IGNORECASE)
-        if m:
-            return int(m.group(1))
-        m_ja = re.search(r"\d+\s*ページ中\s*(\d+)\s*ページ", body_text)
-        if m_ja:
-            return int(m_ja.group(1))
-        m_loc = re.search(r"Location\s+(\d+)\s+of\s+\d+", body_text, re.IGNORECASE)
-        if m_loc:
-            return int(m_loc.group(1))
-        m_loc_ja = re.search(r"位置\s*No\.?\s*(\d+)", body_text)
-        if m_loc_ja:
-            return int(m_loc_ja.group(1))
+        text = page.inner_text("body", timeout=1500) or ""
     except Exception:
-        pass
+        return None
+    for kind, pattern in (
+        ("page", r"Page\s+(\d[\d,]*)\s+of\s+\d[\d,]*"),
+        ("page", r"\d[\d,]*\s*ページ中\s*(\d[\d,]*)\s*ページ"),
+        ("location", r"Location\s+(\d[\d,]*)\s+of\s+\d[\d,]*"),
+        ("location", r"位置\s*No\.?\s*(\d[\d,]*)"),
+    ):
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return kind, int(match.group(1).replace(",", ""))
     return None
+
+
+def get_kindle_page_number(page) -> int | None:
+    position = get_kindle_position(page)
+    return position[1] if position else None
 
 
 def get_kindle_total_pages(page) -> int | None:
@@ -1042,6 +1044,137 @@ def jump_to_kindle_chapter(page, offset: int) -> bool:
             button.click(timeout=2000)
 
 
+KINDLE_GO_TO_NAME = re.compile(r"^(?:Go to Location|位置(?:番号)?へ移動)$", re.IGNORECASE)
+
+
+def open_kindle_location_dialog(page):
+    """Find Go to Location through the reader's visible menu."""
+    entry = page.get_by_text(KINDLE_GO_TO_NAME, exact=True).filter(visible=True).first
+    if not entry.is_visible():
+        menu_name = re.compile(r"^(?:More(?: options| menu| actions| settings)?|その他(?:のオプション)?|詳細(?:設定)?|メニュー)$", re.I)
+        more = page.get_by_role("button", name=menu_name).or_(
+            page.locator("#kr-more, #kr-more-menu, #kr-more-menu-button, #kr-more-settings, [data-testid='more-button']")
+        ).filter(visible=True).first
+        if not more.is_visible():
+            return None
+        more.click(timeout=2000)
+        try:
+            entry.wait_for(state="visible", timeout=1500)
+        except Exception:
+            if more.is_visible():
+                more.click(timeout=1500)
+            return None
+    entry.click(timeout=2000)
+    heading = page.get_by_text(KINDLE_GO_TO_NAME, exact=True).filter(visible=True).last
+    heading.wait_for(state="visible", timeout=2000)
+    panel = heading.locator("xpath=..")
+    for _ in range(4):
+        if panel.evaluate("node => node === document.body || node === document.documentElement"):
+            return None
+        field = panel.locator("input[type=number], input[placeholder='location' i]").filter(visible=True)
+        go = panel.get_by_role("button", name=re.compile(r"^(?:Go|移動)$", re.I)).filter(visible=True)
+        if field.count() == 1 and go.count() == 1:
+            return panel, field, go
+        panel = panel.locator("xpath=..")
+    return None
+
+
+def seek_kindle_position(page, target: int, target_is_printed_page: bool) -> None:
+    """Use location as a seek hint, leaving verification to the checkpoint matcher."""
+    starting_position = get_kindle_position(page)
+    if not starting_position:
+        return
+    kind, current = starting_position
+    if kind != ("page" if target_is_printed_page else "location") or current == target:
+        return
+
+    low, high = 1, None
+    # Printed page labels and location numbers are different units. When the
+    # footer shows pages, bracket the target by observing where each live jump lands.
+    for _ in range(13 if target_is_printed_page else 1):
+        dialog = open_kindle_location_dialog(page)
+        if dialog is None:
+            return
+        panel, field, go = dialog
+        try:
+            if high is None:
+                maximum = field.get_attribute("max", timeout=1000)
+                if not maximum or not maximum.isdigit():
+                    bounds = re.search(r"(?:\bof\s+|全\s*)([\d,]+)", panel.inner_text(timeout=1000), re.I)
+                    maximum = bounds.group(1).replace(",", "") if bounds else None
+                if not maximum or int(maximum) < 1:
+                    return
+                high = int(maximum)
+            if low > high or (not target_is_printed_page and target > high):
+                return
+            location = (low + high) // 2 if target_is_printed_page else target
+            previous_source = page.evaluate(KINDLE_PAGE_SOURCE)
+            field.fill(str(location), timeout=1500)
+            go.click(timeout=2000)
+            field.wait_for(state="hidden", timeout=2000)
+        finally:
+            if field.is_visible():
+                cancel = panel.get_by_role("button", name=re.compile(r"^(?:Cancel|キャンセル)$", re.I)).first
+                if cancel.is_visible():
+                    cancel.click(timeout=1500)
+        if not wait_for_kindle_turn(page, previous_source, timeout_ms=3500):
+            return
+        actual = get_kindle_position(page)
+        if actual is None or actual[0] != kind:
+            return
+        log(f"[Kindle] Go to Location {location} reached {kind} {actual[1]}.")
+        if not target_is_printed_page or abs(actual[1] - target) <= 1:
+            return
+        if actual[1] < target:
+            low = location + 1
+        else:
+            high = location - 1
+
+
+def reopen_kindle_from_library(page, start_url: str, book_title: str | None) -> bool:
+    """Use the reader's library button, selecting the exact book by ASIN or title."""
+    library_name = re.compile(r"^(Back to Library|Kindle Library|ライブラリに戻る|Kindleライブラリ)$", re.I)
+    back = page.get_by_role("button", name=library_name).or_(
+        page.get_by_role("link", name=library_name)
+    ).filter(visible=True).first
+    if not back.is_visible():
+        return False
+
+    previous_source = page.evaluate(KINDLE_PAGE_SOURCE)
+    back.click(timeout=3000)
+    asin = parse_qs(urlparse(start_url).query).get("asin", [""])[0]
+    if not re.fullmatch(r"[A-Za-z0-9]+", asin):
+        return False
+    asin_card = page.locator(
+        f"[data-asin='{asin}'], [id='{asin}'], a[href*='asin={asin}'], a[href$='/{asin}']"
+    ).filter(visible=True).first
+    if book_title:
+        title_card = page.get_by_text(book_title, exact=True).filter(visible=True)
+        asin_card.or_(title_card).first.wait_for(state="visible", timeout=6000)
+    else:
+        asin_card.wait_for(state="visible", timeout=6000)
+
+    if asin_card.is_visible():
+        card = asin_card
+    elif book_title and title_card.count() == 1:
+        card = title_card
+    else:
+        log("[Kindle] Could not identify a unique library entry for this book.")
+        return False
+    card.click(timeout=3000)
+    if not _wait_for_kindle_reader(page, previous_source=previous_source):
+        return False
+    opened_url = urlparse(page.url)
+    if opened_url.hostname != urlparse(start_url).hostname:
+        return False
+    opened_asin = parse_qs(opened_url.query).get("asin", [""])[0]
+    if opened_asin and opened_asin.upper() != asin.upper():
+        log("[Kindle] The library opened a different book.")
+        return False
+    log("[Kindle] Reopened the book from the library.")
+    return True
+
+
 def recover_kindle_oops(
     page,
     start_url: str,
@@ -1050,42 +1183,40 @@ def recover_kindle_oops(
     captured_count: int = 0,
     last_image_hash: str | None = None,
     toc_offset: int | None = None,
+    book_title: str | None = None,
+    fresh_tab: bool = False,
+    use_location: bool = False,
+    expected_total_pages: int | None = None,
 ) -> bool:
-    """Reopen the book through its reader and resume after the last verified capture."""
-    log("[Kindle] Reopening the book to recover the reader...")
+    """Reopen the book and resume after the last verified capture."""
     try:
-        previous_source = page.evaluate(KINDLE_PAGE_SOURCE)
-        back_btn = page.get_by_role("button", name="Back to Library").or_(
-            page.get_by_role("link", name="Back to Library")
-        ).first
-        if back_btn.is_visible():
-            try:
-                back_btn.click(timeout=3000)
-            except Exception:
-                pass
-
-        asin = parse_qs(urlparse(start_url).query).get("asin", [""])[0]
         opened_from_library = False
-        if re.fullmatch(r"[A-Za-z0-9]+", asin):
-            card = page.locator(
-                f"[data-asin='{asin}'], [id*='{asin}'], a[href*='{asin}']"
-            ).first
+        if not fresh_tab:
+            log("[Kindle] Trying to reopen the book from the library...")
             try:
-                card.wait_for(state="visible", timeout=4000)
-                card.click(timeout=3000)
-                opened_from_library = _wait_for_kindle_reader(page, previous_source=previous_source)
-            except Exception:
-                pass
-
+                opened_from_library = reopen_kindle_from_library(page, start_url, book_title)
+            except Exception as exc:
+                log(f"[Kindle] Library reopen did not finish ({type(exc).__name__}).")
         if not opened_from_library:
-            page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
+            response = page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
+            check_access_denied(page, response.status if response else None)
             if not _wait_for_kindle_reader(page):
+                log("[Kindle] The reopened reader did not render a page.")
                 return False
 
         if captured_count == 0:
             if is_kindle_not_at_start(page):
                 rewind_kindle_to_start(page, turn_key)
             return _wait_for_kindle_reader(page)
+
+        if use_location and last_kindle_page is not None and last_image_hash is not None:
+            try:
+                seek_kindle_position(page, last_kindle_page, expected_total_pages is not None)
+            except Exception as exc:
+                log(f"[Kindle] Go to Location unavailable ({type(exc).__name__}).")
+                page.keyboard.press("Escape")
+            if is_kindle_oops(page):
+                return False
 
         if toc_offset is not None and last_image_hash is not None and last_kindle_page is not None:
             log("[Kindle] Trying the table of contents to recover the page turn...")
@@ -1105,10 +1236,12 @@ def recover_kindle_oops(
         if last_kindle_page is None or get_kindle_page_number(page) is None:
             rewind_kindle_to_start(page, turn_key)
         reverse_key = "ArrowRight" if turn_key == "ArrowLeft" else "ArrowLeft"
+        expected_position_kind = "page" if expected_total_pages is not None else None
         for _ in range(max(captured_count + 20, 40)):
             if is_kindle_oops(page):
                 return False
-            position = get_kindle_page_number(page)
+            marker = get_kindle_position(page)
+            position = marker[1] if marker and expected_position_kind in (None, marker[0]) else None
             source = page.evaluate(KINDLE_PAGE_SOURCE)
             if not source:
                 return False
@@ -1529,12 +1662,16 @@ def fetch_via_browser(
             wait_for_page_ready(page, timeout_ms=12000)
             check_access_denied(page, response_status)
             resolved_output = output_path
-            if auto_name:
+            kindle_mode = is_kindle_cloud_reader(page)
+            detected_title, detected_pub = None, None
+            reader_error_at_open = kindle_mode and is_kindle_oops(page)
+            if (auto_name or kindle_mode) and not reader_error_at_open:
                 detected_title, detected_pub = extract_book_title_and_date(page)
+            if auto_name:
                 resolved_output = resolve_auto_output_path(output_path, detected_title, detected_pub)
                 if resolved_output != output_path:
                     log(f"[AutoName] Output filename -> {resolved_output.name}")
-            kindle_mode = is_kindle_cloud_reader(page)
+            book_title = detected_title if kindle_mode else None
             saved_pages = kindle_checkpoint.load() if kindle_mode and kindle_checkpoint else []
             if saved_pages:
                 log(f"[Kindle] Loaded {len(saved_pages)} saved page(s); resuming capture.")
@@ -1620,20 +1757,68 @@ def fetch_via_browser(
                 if kindle_mode:
                     dismiss_kindle_dialogs(page)
                     if needs_recovery or is_kindle_oops(page):
-                        if recovery_attempts >= 3:
+                        if recovery_attempts >= 4:
                             raise IncompleteKindleCapture(
                                 f"Kindleのエラーから復旧できませんでした（取得済み: {page_idx - 1} ページ）。",
                                 page_idx - 1, expected_total_pages,
                             )
                         recovery_attempts += 1
-                        log(f"[Kindle] Recovering before capture {page_idx} ({recovery_attempts}/3)...")
-                        needs_recovery = not recover_kindle_oops(
-                            page, start_url, last_kindle_page, turn_key,
+                        log(f"[Kindle] Recovering before capture {page_idx} ({recovery_attempts}/4)...")
+                        recovery_options = dict(
                             captured_count=page_idx - 1,
                             last_image_hash=last_kindle_image_hash,
-                            toc_offset={2: 1, 3: 0}.get(recovery_attempts),
+                            toc_offset={3: 1, 4: 0}.get(recovery_attempts),
+                            book_title=book_title,
+                            use_location=recovery_attempts in (1, 2),
+                            expected_total_pages=expected_total_pages,
                         )
-                        if needs_recovery:
+                        if recovery_attempts == 1:
+                            recovered = recover_kindle_oops(
+                                page, start_url, last_kindle_page, turn_key, **recovery_options,
+                            )
+                        else:
+                            log("[Kindle] Trying a new tab with the current browser session...")
+                            recovered = False
+                            candidate = None
+                            try:
+                                candidate = context.new_page()
+                                if page.viewport_size:
+                                    candidate.set_viewport_size(page.viewport_size)
+                                elif created_page:
+                                    candidate.set_viewport_size({"width": 800, "height": 1140})
+                                recovered = recover_kindle_oops(
+                                    candidate, start_url, last_kindle_page, turn_key,
+                                    fresh_tab=True, **recovery_options,
+                                )
+                            except Exception as exc:
+                                log(f"[Kindle] New-tab recovery failed ({type(exc).__name__}).")
+                            finally:
+                                if candidate is not None and not recovered:
+                                    try:
+                                        candidate.close()
+                                    except Exception:
+                                        pass
+                            if recovered:
+                                previous_page, previous_owned = page, created_page
+                                page, created_page = candidate, True
+                                page.on("response", handle_response)
+                                cdp_session = None
+                                try:
+                                    cdp_session = context.new_cdp_session(page)
+                                except Exception:
+                                    pass
+                                if previous_owned:
+                                    try:
+                                        previous_page.close()
+                                    except Exception:
+                                        pass
+                                log("[Kindle] Switched capture to the verified new tab.")
+                        needs_recovery = not recovered
+                        if recovered and book_title is None:
+                            book_title, published = extract_book_title_and_date(page)
+                            if auto_name and resolved_output == output_path and book_title:
+                                resolved_output = resolve_auto_output_path(output_path, book_title, published)
+                        if needs_recovery and not page.is_closed():
                             page.wait_for_timeout(1000)
                         continue
                     if page_idx == 1 and recovery_attempts == 0:

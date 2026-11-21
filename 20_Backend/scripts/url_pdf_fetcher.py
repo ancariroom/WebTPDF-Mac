@@ -729,7 +729,23 @@ def get_kindle_total_pages(page) -> int | None:
     return None
 
 
-def verify_exported_pdf(pdf_path: Path, expected_pages: int | None = None) -> dict:
+def get_kindle_progress_percent(page) -> int | None:
+    """Extract reading progress percentage (0-100) from Kindle Cloud Reader footer."""
+    try:
+        body_text = page.inner_text("body") or ""
+        m = re.search(r"●\s*(\d{1,3})%", body_text)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
+def verify_exported_pdf(
+    pdf_path: Path,
+    expected_pages: int | None = None,
+    last_percent: int | None = None,
+) -> dict:
     """Verify exported PDF for page count, blank pages, edge clipping, and readability margins."""
     import pymupdf
 
@@ -773,6 +789,8 @@ def verify_exported_pdf(pdf_path: Path, expected_pages: int | None = None) -> di
         warnings: list[str] = []
         if expected_pages is not None and page_count < expected_pages:
             warnings.append(f"ページ不足({page_count}/{expected_pages}p)")
+        elif last_percent is not None and last_percent < 95:
+            warnings.append(f"途中終了の疑い(進行率{last_percent}%)")
         if blank_pages:
             warnings.append(f"空白ページ({len(blank_pages)}p)")
         if clipped_pages:
@@ -1320,6 +1338,7 @@ def fetch_via_browser(
             turn_key = "ArrowLeft" if direction == "left" else "ArrowRight"
             if direction == "left":
                 arrow_button_selectors = [
+                    "#kr-chevron-left:not([disabled])",
                     "button:has-text('←'):not([disabled])",
                     "a:has-text('←')",
                     "button:has-text('‹'):not([disabled])",
@@ -1332,6 +1351,7 @@ def fetch_via_browser(
                 ]
             else:
                 arrow_button_selectors = [
+                    "#kr-chevron-right:not([disabled])",
                     "button:has-text('→'):not([disabled])",
                     "a:has-text('→')",
                     "button:has-text('›'):not([disabled])",
@@ -1348,6 +1368,7 @@ def fetch_via_browser(
             prev_pdf_hash: str | None = None
             last_kindle_page: int | None = None
             expected_total_pages: int | None = None
+            last_kindle_percent: int | None = None
 
             for page_idx in range(1, max_pages + 1):
                 if kindle_mode:
@@ -1389,12 +1410,47 @@ def fetch_via_browser(
                 current_hash = hashlib.sha256(png_bytes).hexdigest()
 
                 if prev_hash == current_hash:
-                    log(f"[Browser] Page {page_idx} identical to previous; stopping pagination.")
-                    break
+                    if kindle_mode:
+                        # Retry page turn on slow networks / chapter boundaries before stopping
+                        max_turn_retries = 3 if (expected_total_pages and last_kindle_page and last_kindle_page < expected_total_pages) else 2
+                        advanced = False
+                        for retry_idx in range(max_turn_retries):
+                            log(f"[Kindle] Page {page_idx} unchanged; retrying turn ({retry_idx + 1}/{max_turn_retries})...")
+                            dismiss_kindle_dialogs(page)
+                            if is_kindle_oops(page):
+                                break
+                            page.keyboard.press(turn_key)
+                            page.wait_for_timeout(1500)
+                            png_retry = page.screenshot(full_page=False, timeout=15000)
+                            retry_hash = hashlib.sha256(png_retry).hexdigest()
+                            if retry_hash == prev_hash:
+                                for selector in arrow_button_selectors:
+                                    locator = page.locator(selector).first
+                                    try:
+                                        if locator.count() > 0 and locator.is_visible():
+                                            locator.click(timeout=3000)
+                                            page.wait_for_timeout(1500)
+                                            break
+                                    except Exception:
+                                        continue
+                                png_retry = page.screenshot(full_page=False, timeout=15000)
+                                retry_hash = hashlib.sha256(png_retry).hexdigest()
+                            if retry_hash != prev_hash:
+                                png_bytes = png_retry
+                                current_hash = retry_hash
+                                advanced = True
+                                break
+                        if not advanced and is_kindle_oops(page):
+                            continue
+                    if prev_hash == current_hash:
+                        log(f"[Browser] Page {page_idx} identical to previous; stopping pagination.")
+                        break
 
                 prev_hash = current_hash
                 pdf_count_before = len(captured_pdfs)
                 if kindle_mode:
+                    if _find_kindle_page_box(page) is None:
+                        _wait_for_kindle_reader(page, timeout_ms=8000)
                     k_res = capture_kindle_page_as_pdf_bytes(page)
                     if k_res is not None:
                         page_pdf_bytes, k_png = k_res
@@ -1443,6 +1499,9 @@ def fetch_via_browser(
                     k_total = get_kindle_total_pages(page)
                     if k_total is not None:
                         expected_total_pages = k_total
+                    k_pct = get_kindle_progress_percent(page)
+                    if k_pct is not None:
+                        last_kindle_percent = k_pct
                 log(f"[Browser] Captured page {page_idx} via PDF command ({len(page_pdf_bytes)} bytes)")
 
                 url_before_turn = page.url
@@ -1459,7 +1518,7 @@ def fetch_via_browser(
                         page.wait_for_function(
                             "(prev) => { const img = document.querySelector('img[src^=\"blob:\"]'); return img && img.complete && img.src !== prev; }",
                             arg=prev_kindle_src,
-                            timeout=3000,
+                            timeout=5000,
                         )
                     except Exception:
                         pass
@@ -1490,7 +1549,11 @@ def fetch_via_browser(
             else:
                 written = merge_pdf_bytes_list(collected_page_pdfs, resolved_output)
             try:
-                qc = verify_exported_pdf(resolved_output, expected_pages=expected_total_pages)
+                qc = verify_exported_pdf(
+                    resolved_output,
+                    expected_pages=expected_total_pages,
+                    last_percent=last_kindle_percent,
+                )
                 log(f"[Verify] {qc['summary']}")
                 log(f"QUALITY_CHECK={qc['summary']}")
             except Exception as qc_exc:

@@ -9,6 +9,7 @@ import io
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import urljoin, urlparse
@@ -71,11 +72,13 @@ def download_if_pdf(session: requests.Session, url: str, timeout: int) -> bytes 
         log(f"[WARN] Failed to fetch {url}: {exc}")
         return None
 
+
     content_type = response.headers.get("Content-Type", "").lower()
     data = response.content
     if "application/pdf" in content_type or is_pdf_bytes(data):
         return data
     return None
+
 
 
 def extract_pdf_links_from_html(html: str | bytes, base_url: str) -> list[str]:
@@ -114,12 +117,15 @@ def find_next_page_url(html: str | bytes, current_url: str) -> str | None:
     def normalize_same_host(raw_href: str | None) -> str | None:
         if not raw_href:
             return None
+
         candidate = urljoin(current_url, raw_href.strip())
         parsed = urlparse(candidate)
         if not is_http_url(candidate) or parsed.netloc != current_host:
             return None
+
         if candidate == current_url:
             return None
+
         return candidate
 
     # 1. Explicit rel="next"
@@ -162,6 +168,7 @@ def find_next_page_url(html: str | bytes, current_url: str) -> str | None:
                     return resolved
 
     return None
+
 
 
 def merge_pdf_bytes_list(pdf_blobs: Iterable[bytes], output_path: Path) -> int:
@@ -278,6 +285,7 @@ def resolve_cdp_url(candidates: tuple[str, ...] = (
         except requests.RequestException:
             continue
     return None
+
 
 
 PRINT_CLEANUP_STYLE_ID = "__ebookconverter_print_cleanup__"
@@ -546,6 +554,7 @@ def capture_fixed_layout_pf_pages(page, cdp_session=None) -> bytes | None:
     if not pf_count:
         return None
 
+
     try:
         page.evaluate(
             """() => {
@@ -566,6 +575,7 @@ def capture_fixed_layout_pf_pages(page, cdp_session=None) -> bytes | None:
 
             if not images:
                 return None
+
 
             buf = io.BytesIO()
             images[0].save(
@@ -624,21 +634,37 @@ def dismiss_kindle_dialogs(page) -> bool:
     return False
 
 
-def rewind_kindle_to_start(page, turn_key: str, max_steps: int = 300) -> None:
+def is_kindle_not_at_start(page) -> bool:
+    """Return True if Kindle Cloud Reader is currently past page 1 / > 0%."""
+    try:
+        body_text = page.inner_text("body") or ""
+        cur = get_kindle_page_number(page)
+        if cur is not None and cur > 1:
+            return True
+        m_pct = re.search(r"●\s*([1-9]\d*)%", body_text)
+        if m_pct:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def rewind_kindle_to_start(page, turn_key: str, max_steps: int = 600) -> None:
     """Step backwards in Kindle Cloud Reader until reaching the first page (cover)."""
     reverse_key = "ArrowRight" if turn_key == "ArrowLeft" else "ArrowLeft"
-    log(f"[Kindle] 'Most Recent Page Read' detected; rewinding to first page via {reverse_key}...")
+    log(f"[Kindle] Not at first page; rewinding to start via {reverse_key}...")
     unchanged = 0
     for step in range(max_steps):
+        dismiss_kindle_dialogs(page)
         prev_src = page.evaluate("() => document.querySelector('img[src^=\"blob:\"]')?.src || ''")
         page.keyboard.press(reverse_key)
-        page.wait_for_timeout(300)
+        page.wait_for_timeout(160)
         changed = False
         try:
             page.wait_for_function(
                 "(prev) => { const img = document.querySelector('img[src^=\"blob:\"]'); return img && img.complete && img.src !== prev; }",
                 arg=prev_src,
-                timeout=1200,
+                timeout=800,
             )
             changed = True
         except Exception:
@@ -648,7 +674,8 @@ def rewind_kindle_to_start(page, turn_key: str, max_steps: int = 300) -> None:
             unchanged = 0
         else:
             unchanged += 1
-            if unchanged >= 2:
+            page.wait_for_timeout(300)
+            if unchanged >= 3:
                 log(f"[Kindle] Reached first page after {step + 1} backward step(s).")
                 return
     log(f"[Kindle] Rewind stopped after {max_steps} steps.")
@@ -685,6 +712,92 @@ def get_kindle_page_number(page) -> int | None:
     except Exception:
         pass
     return None
+
+
+def get_kindle_total_pages(page) -> int | None:
+    """Extract total page count from Kindle Cloud Reader footer when available."""
+    try:
+        body_text = page.inner_text("body") or ""
+        m = re.search(r"Page\s+\d+\s+of\s+(\d+)", body_text, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+        m_ja = re.search(r"(\d+)\s*ページ中\s*\d+\s*ページ", body_text)
+        if m_ja:
+            return int(m_ja.group(1))
+    except Exception:
+        pass
+    return None
+
+
+def verify_exported_pdf(pdf_path: Path, expected_pages: int | None = None) -> dict:
+    """Verify exported PDF for page count, blank pages, edge clipping, and readability margins."""
+    import pymupdf
+
+    doc = pymupdf.open(str(pdf_path))
+    try:
+        page_count = len(doc)
+        blank_pages: list[int] = []
+        clipped_pages: list[int] = []
+        min_margin_ratio = 1.0
+
+        for idx, page in enumerate(doc):
+            pix = page.get_pixmap(dpi=72)
+            w, h = pix.width, pix.height
+            if w <= 0 or h <= 0:
+                blank_pages.append(idx + 1)
+                continue
+            img = Image.frombytes("RGB" if pix.n >= 3 else "L", (w, h), pix.samples).convert("L")
+            mask = img.point(lambda px: 255 if px < 245 else 0)
+            bbox = mask.getbbox()
+            if bbox is None:
+                blank_pages.append(idx + 1)
+                continue
+
+            left, top, right, bottom = bbox
+            if idx > 0:
+                margin_ratio = min(
+                    left / float(w),
+                    top / float(h),
+                    (w - right) / float(w),
+                    (h - bottom) / float(h),
+                )
+                if margin_ratio < min_margin_ratio:
+                    min_margin_ratio = margin_ratio
+
+                if left <= 1 or top <= 1 or right >= w - 1 or bottom >= h - 1:
+                    dark_mask = img.point(lambda px: 255 if px < 180 else 0)
+                    db = dark_mask.getbbox()
+                    if db and (db[0] <= 1 or db[1] <= 1 or db[2] >= w - 1 or db[3] >= h - 1):
+                        clipped_pages.append(idx + 1)
+
+        warnings: list[str] = []
+        if expected_pages is not None and page_count < expected_pages:
+            warnings.append(f"ページ不足({page_count}/{expected_pages}p)")
+        if blank_pages:
+            warnings.append(f"空白ページ({len(blank_pages)}p)")
+        if clipped_pages:
+            warnings.append(f"端切れ/はみ出し疑い({len(clipped_pages)}p)")
+        if page_count > 1 and min_margin_ratio < 0.02:
+            warnings.append(f"余白狭い({min_margin_ratio * 100:.1f}%)")
+
+        status = "OK" if not warnings else "WARN"
+        page_info = f"{page_count}/{expected_pages}p" if expected_pages is not None else f"{page_count}p"
+        margin_info = f"最小余白{min_margin_ratio * 100:.1f}%" if page_count > 1 else "余白N/A"
+        summary = f"{status} ({page_info}, {margin_info}, 空白{len(blank_pages)}p, 切れ疑い{len(clipped_pages)}p)"
+        if warnings:
+            summary = f"{status}: {', '.join(warnings)} [{summary}]"
+
+        return {
+            "status": status,
+            "page_count": page_count,
+            "expected_pages": expected_pages,
+            "blank_pages": blank_pages,
+            "clipped_pages": clipped_pages,
+            "min_margin_ratio": min_margin_ratio,
+            "summary": summary,
+        }
+    finally:
+        doc.close()
 
 
 def _wait_for_kindle_reader(page, timeout_ms: int = 15000) -> bool:
@@ -805,11 +918,13 @@ def _find_kindle_page_box(page) -> dict | None:
         return None
 
 
+
 def capture_kindle_page_as_pdf_bytes(page, pad_ratio: float = 0.07) -> tuple[bytes, bytes] | None:
     """Capture the rendered Kindle page blob image via clipped screenshot with comfortable book margins."""
     box = _find_kindle_page_box(page)
     if not box:
         return None
+
     png_bytes = page.screenshot(clip=box, timeout=15000)
     buf = io.BytesIO()
     with Image.open(io.BytesIO(png_bytes)) as img:
@@ -832,6 +947,7 @@ def measure_cover_aspect_ratio(png_bytes: bytes) -> float | None:
             bbox = im.convert("RGB").point(lambda x: 0 if x > 245 else 255).getbbox()
             if not bbox:
                 return None
+
             cw = bbox[2] - bbox[0]
             ch = bbox[3] - bbox[1]
             if cw > 100 and ch > 100 and ch > cw:
@@ -839,6 +955,7 @@ def measure_cover_aspect_ratio(png_bytes: bytes) -> float | None:
     except Exception:
         pass
     return None
+
 
 
 def capture_page_as_pdf_bytes(page, cdp_session=None) -> bytes:
@@ -1230,11 +1347,23 @@ def fetch_via_browser(
             prev_hash: str | None = None
             prev_pdf_hash: str | None = None
             last_kindle_page: int | None = None
+            expected_total_pages: int | None = None
 
             for page_idx in range(1, max_pages + 1):
                 if kindle_mode:
-                    if dismiss_kindle_dialogs(page) and page_idx == 1:
-                        rewind_kindle_to_start(page, turn_key)
+                    if page_idx == 1:
+                        _wait_for_kindle_reader(page, timeout_ms=15000)
+                        saw_recent = False
+                        for _ in range(5):
+                            if dismiss_kindle_dialogs(page):
+                                saw_recent = True
+                            if saw_recent or is_kindle_not_at_start(page):
+                                break
+                            page.wait_for_timeout(500)
+                        if saw_recent or is_kindle_not_at_start(page):
+                            rewind_kindle_to_start(page, turn_key)
+                    else:
+                        dismiss_kindle_dialogs(page)
                     if is_kindle_oops(page):
                         recovered = False
                         for attempt in range(3):
@@ -1311,6 +1440,9 @@ def fetch_via_browser(
                     k_num = get_kindle_page_number(page)
                     if k_num is not None:
                         last_kindle_page = k_num
+                    k_total = get_kindle_total_pages(page)
+                    if k_total is not None:
+                        expected_total_pages = k_total
                 log(f"[Browser] Captured page {page_idx} via PDF command ({len(page_pdf_bytes)} bytes)")
 
                 url_before_turn = page.url
@@ -1354,8 +1486,16 @@ def fetch_via_browser(
                             continue
 
             if captured_pdfs and len(captured_pdfs) >= len(collected_page_pdfs):
-                return merge_pdf_bytes_list(captured_pdfs, resolved_output), resolved_output
-            return merge_pdf_bytes_list(collected_page_pdfs, resolved_output), resolved_output
+                written = merge_pdf_bytes_list(captured_pdfs, resolved_output)
+            else:
+                written = merge_pdf_bytes_list(collected_page_pdfs, resolved_output)
+            try:
+                qc = verify_exported_pdf(resolved_output, expected_pages=expected_total_pages)
+                log(f"[Verify] {qc['summary']}")
+                log(f"QUALITY_CHECK={qc['summary']}")
+            except Exception as qc_exc:
+                log(f"[Verify] Skipped ({qc_exc})")
+            return written, resolved_output
         finally:
             if created_page:
                 try:

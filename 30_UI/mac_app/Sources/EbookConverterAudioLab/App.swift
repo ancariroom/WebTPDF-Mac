@@ -1983,16 +1983,26 @@ final class AppModel: ObservableObject {
                 guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else {
                     return
                 }
+                var qualitySummary: String?
                 for line in chunk.components(separatedBy: .newlines) {
                     if line.hasPrefix("OUTPUT_PDF=") {
                         let candidate = String(line.dropFirst("OUTPUT_PDF=".count)).trimmingCharacters(in: .whitespacesAndNewlines)
                         if !candidate.isEmpty {
                             resolvedOutputPath.set(candidate)
                         }
+                    } else if line.hasPrefix("QUALITY_CHECK=") {
+                        let summary = String(line.dropFirst("QUALITY_CHECK=".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !summary.isEmpty {
+                            qualitySummary = summary
+                        }
                     }
                 }
+                let capturedQuality = qualitySummary
                 Task { @MainActor in
                     self?.appendLog(chunk)
+                    if let capturedQuality {
+                        self?.statusMessage = "PDF検証: \(capturedQuality)"
+                    }
                 }
             }
 

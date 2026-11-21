@@ -1488,8 +1488,28 @@ def fetch_via_browser(
                         break
                 current_pdf_hash = pdf_content_signature(page_pdf_bytes)
                 if prev_pdf_hash == current_pdf_hash:
-                    log(f"[Browser] Page {page_idx} PDF content identical to previous; stopping pagination.")
-                    break
+                    if kindle_mode:
+                        for pdf_retry in range(2):
+                            log(f"[Kindle] Page {page_idx} PDF content unchanged; retrying turn ({pdf_retry + 1}/2)...")
+                            page.keyboard.press(turn_key)
+                            page.wait_for_timeout(2000)
+                            k_res_retry = capture_kindle_page_as_pdf_bytes(page)
+                            if k_res_retry is not None:
+                                page_pdf_bytes = k_res_retry[0]
+                            else:
+                                page_pdf_bytes = capture_page_as_pdf_bytes(page, cdp_session=cdp_session)
+                            current_pdf_hash = pdf_content_signature(page_pdf_bytes)
+                            if current_pdf_hash != prev_pdf_hash:
+                                break
+                    if prev_pdf_hash == current_pdf_hash:
+                        if kindle_mode:
+                            try:
+                                stop_snippet = (page.inner_text("body") or "").replace("\n", " | ")[:200]
+                                log(f"[Kindle] Stop context: {stop_snippet}")
+                            except Exception:
+                                pass
+                        log(f"[Browser] Page {page_idx} PDF content identical to previous; stopping pagination.")
+                        break
                 prev_pdf_hash = current_pdf_hash
                 collected_page_pdfs.append(page_pdf_bytes)
                 if kindle_mode:

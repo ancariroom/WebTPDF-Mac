@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 
 /**
- * Core browser engine for EbookConverter.
+ * Core browser engine for WebTPDF.
  * Handles CDP connection and basic page interactions.
  */
 class BrowserEngine {

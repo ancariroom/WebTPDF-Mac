@@ -2,7 +2,7 @@
 """Run ebook2audiobook through Docker with repo-friendly defaults.
 
 This wrapper keeps the upstream ebook2audiobook project as the source of
-truth while giving EbookConverter a stable local entrypoint for audiobook
+truth while giving WebTPDF a stable local entrypoint for audiobook
 generation.
 """
 
@@ -18,7 +18,7 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[1]
-CACHE_ROOT = Path.home() / ".cache" / "ebookconverter" / "ebook2audiobook"
+CACHE_ROOT = Path.home() / ".cache" / "webtpdf" / "ebook2audiobook"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "40_Ops" / "output" / "audiobooks"
 DEFAULT_MODELS_DIR = CACHE_ROOT / "models"
 DEFAULT_TMP_DIR = CACHE_ROOT / "tmp"
@@ -50,7 +50,7 @@ def parse_device(raw_device: str) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run ebook2audiobook via Docker with EbookConverter defaults."
+        description="Run ebook2audiobook via Docker with WebTPDF defaults."
     )
     parser.add_argument("--ebook", required=True, help="Path to the input ebook file.")
     parser.add_argument(

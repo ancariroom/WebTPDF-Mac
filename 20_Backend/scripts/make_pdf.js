@@ -12,7 +12,7 @@ if (!bookId) {
     process.exit(1);
 }
 
-console.log(`[Wrapper] Forwarding request to EbookConverter for book ID: ${bookId}...`);
+console.log(`[Wrapper] Forwarding request to WebTPDF for book ID: ${bookId}...`);
 
 const ebookConvertPath = path.join(__dirname, '../bin/ebook-convert.js');
 

@@ -46,7 +46,7 @@ DOCKER_CANDIDATES = (
 )
 
 
-app = FastAPI(title="EbookConverter Audio Lab")
+app = FastAPI(title="WebTPDF Audio Lab")
 _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
 
@@ -456,7 +456,7 @@ INDEX_HTML = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>EbookConverter Audio Lab</title>
+  <title>WebTPDF Audio Lab</title>
   <style>
     :root {
       color-scheme: light;
@@ -714,7 +714,7 @@ INDEX_HTML = """<!doctype html>
   <main class="shell">
     <div class="hero">
       <div>
-        <h1>EbookConverter Audio Lab</h1>
+        <h1>WebTPDF Audio Lab</h1>
         <p>PDF / EPUB / MOBI をアップロードして、`ebook2audiobook` がどんな音声ファイルを返すかその場で試すための画面です。出力は job ごとに分けて保存します。</p>
       </div>
       <div class="status-line" id="system-status">
@@ -915,13 +915,13 @@ INDEX_HTML = """<!doctype html>
 
 
 def cli() -> None:
-    parser = argparse.ArgumentParser(description="Launch the EbookConverter audiobook UI.")
+    parser = argparse.ArgumentParser(description="Launch the WebTPDF audiobook UI.")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind (default: 127.0.0.1).")
     parser.add_argument("--port", type=int, default=8765, help="Port to bind (default: 8765).")
     args = parser.parse_args()
 
     JOB_ROOT.mkdir(parents=True, exist_ok=True)
-    print(f"Serving EbookConverter Audio Lab on http://{args.host}:{args.port}")
+    print(f"Serving WebTPDF Audio Lab on http://{args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

@@ -30,8 +30,8 @@ swiftc \
   -O \
   -parse-as-library \
   -o "$EXECUTABLE" \
-  "$SCRIPT_DIR/Sources/EbookConverterAudioLab/App.swift" \
-  "$SCRIPT_DIR/Sources/EbookConverterAudioLab/PDFLibraryPreferences.swift" \
+  "$SCRIPT_DIR/Sources/WebTPDF/App.swift" \
+  "$SCRIPT_DIR/Sources/WebTPDF/PDFLibraryPreferences.swift" \
   -framework SwiftUI \
   -framework AVFoundation \
   -framework PDFKit \

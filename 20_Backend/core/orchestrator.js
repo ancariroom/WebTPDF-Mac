@@ -3,7 +3,7 @@ const path = require('path');
 const BrowserEngine = require('../core/browser_engine');
 
 /**
- * Main orchestrator for EbookConverter.
+ * Main orchestrator for WebTPDF.
  * Site-agnostic logic for scraping pages using an adapter.
  */
 class EbookConvertOrchestrator {

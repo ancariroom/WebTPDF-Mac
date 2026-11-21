@@ -288,7 +288,7 @@ def resolve_cdp_url(candidates: tuple[str, ...] = (
 
 
 
-PRINT_CLEANUP_STYLE_ID = "__ebookconverter_print_cleanup__"
+PRINT_CLEANUP_STYLE_ID = "__webtpdf_print_cleanup__"
 
 
 def inject_print_cleanup(page) -> dict:

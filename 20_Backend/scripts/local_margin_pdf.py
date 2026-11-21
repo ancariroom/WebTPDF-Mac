@@ -362,7 +362,7 @@ def write_pdf(pages: list[PdfPage], out_path: Path, title: str) -> None:
     objects[catalog_id - 1] = f"<< /Type /Catalog /Pages {pages_id} 0 R >>".encode("ascii")
     kids = b" ".join(f"{page_id} 0 R".encode("ascii") for page_id in page_ids)
     objects[pages_id - 1] = b"<< /Type /Pages /Kids [" + kids + f"] /Count {len(page_ids)} >>".encode("ascii")
-    info_id = add(b"<< /Title (" + pdf_escape(title) + b") /Producer (EbookConverter local-margin-pdf) >>")
+    info_id = add(b"<< /Title (" + pdf_escape(title) + b") /Producer (WebTPDF local-margin-pdf) >>")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile("wb", delete=False, dir=str(out_path.parent), prefix=out_path.name + ".tmp.") as file:

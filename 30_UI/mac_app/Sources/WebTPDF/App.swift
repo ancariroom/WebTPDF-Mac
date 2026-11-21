@@ -6,7 +6,7 @@ import UniformTypeIdentifiers
 @preconcurrency import UserNotifications
 
 @main
-struct EbookConverterAudioLabApp: App {
+struct WebTPDFApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var model = AppModel()
 
@@ -235,6 +235,7 @@ final class AppModel: ObservableObject {
         }
         return decoded
     }()
+    @Published var historyPageIndex: Int = 0
     @Published private(set) var isRunningQueue = false
     @Published var isQueueAutoPaused = false
     @Published var squeezerTargetURL: URL?
@@ -333,12 +334,12 @@ final class AppModel: ObservableObject {
 
     private var applicationSupportRoot: URL {
         if let baseURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
-            return baseURL.appendingPathComponent("EbookConverter Audio Lab", isDirectory: true)
+            return baseURL.appendingPathComponent("WebTPDF Audio Lab", isDirectory: true)
         }
         return URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
             .appendingPathComponent("Library", isDirectory: true)
             .appendingPathComponent("Application Support", isDirectory: true)
-            .appendingPathComponent("EbookConverter Audio Lab", isDirectory: true)
+            .appendingPathComponent("WebTPDF Audio Lab", isDirectory: true)
     }
 
     private var outputRoot: URL {
@@ -351,7 +352,7 @@ final class AppModel: ObservableObject {
     private var cacheRoot: URL {
         URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
             .appendingPathComponent(".cache", isDirectory: true)
-            .appendingPathComponent("ebookconverter", isDirectory: true)
+            .appendingPathComponent("webtpdf", isDirectory: true)
             .appendingPathComponent("ebook2audiobook", isDirectory: true)
     }
 
@@ -727,11 +728,16 @@ final class AppModel: ObservableObject {
 
     func removeURLFetchHistoryItem(_ id: UUID) {
         urlFetchHistory.removeAll { $0.id == id }
+        let totalPages = max(1, (urlFetchHistory.count + 9) / 10)
+        if historyPageIndex >= totalPages {
+            historyPageIndex = max(0, totalPages - 1)
+        }
         saveURLFetchHistory()
     }
 
     func clearURLFetchHistory() {
         urlFetchHistory.removeAll()
+        historyPageIndex = 0
         saveURLFetchHistory()
     }
 
@@ -2621,12 +2627,6 @@ struct ContentView: View {
     private var urlToPDFView: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(model.t("Webページから1枚のPDFを作成", "Create a Single PDF from a Web Page"))
-                        .font(.title2.bold())
-                    Text(model.t("対象URLを開き、指定方向のカーソルキーでページ送りしながら全ページを結合してデスクトップに保存します。", "Opens the target URL, turns pages with the selected arrow key, and saves a merged PDF to your Desktop."))
-                        .foregroundStyle(.secondary)
-                }
 
                 HStack(spacing: 12) {
                     topologyCard(model.t("ソースURL", "Source URL"), symbol: "globe", detail: model.trimmedSourceURL.isEmpty ? model.t("未入力", "Empty") : model.t("入力済み", "Ready"))
@@ -2849,15 +2849,23 @@ struct ContentView: View {
     }
 
     private var fetchHistorySection: some View {
-        GroupBox {
+        let pageSize = 10
+        let totalCount = model.urlFetchHistory.count
+        let totalPages = max(1, (totalCount + pageSize - 1) / pageSize)
+        let currentPage = min(max(0, model.historyPageIndex), totalPages - 1)
+        let startIdx = currentPage * pageSize
+        let endIdx = min(totalCount, startIdx + pageSize)
+        let pageEntries = startIdx < endIdx ? Array(model.urlFetchHistory[startIdx..<endIdx]) : []
+
+        return GroupBox {
             VStack(alignment: .leading, spacing: 8) {
-                if model.urlFetchHistory.isEmpty {
+                if pageEntries.isEmpty {
                     Text(model.t("まだURL取得の履歴はありません。", "No URL fetch history yet."))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .padding(.vertical, 4)
                 } else {
-                    ForEach(Array(model.urlFetchHistory.prefix(30).enumerated()), id: \.element.id) { idx, entry in
+                    ForEach(Array(pageEntries.enumerated()), id: \.element.id) { idx, entry in
                         HStack(spacing: 10) {
                             Image(systemName: entry.succeeded ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                                 .foregroundStyle(entry.succeeded ? Color.green : Color.orange)
@@ -2885,8 +2893,13 @@ struct ContentView: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
 
                             if let path = entry.outputPath, FileManager.default.fileExists(atPath: path) {
+                                let pdfURL = URL(fileURLWithPath: path)
                                 Button(model.t("開く", "Open")) {
-                                    NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                                    NSWorkspace.shared.open(pdfURL)
+                                }
+                                Button(model.t("音声変換へ", "Convert to Audio")) {
+                                    model.ebookURL = pdfURL
+                                    destination = .audioLab
                                 }
                             }
 
@@ -2901,19 +2914,44 @@ struct ContentView: View {
                                 Image(systemName: "trash")
                             }
                             .buttonStyle(.borderless)
+                            .help(model.t("この履歴を削除", "Delete this history item"))
                         }
-                        if idx < min(model.urlFetchHistory.count, 30) - 1 {
+                        if idx < pageEntries.count - 1 {
                             Divider()
                         }
+                    }
+
+                    if totalPages > 1 {
+                        Divider()
+                        HStack {
+                            Button(model.t("前へ", "Previous")) {
+                                model.historyPageIndex = max(0, currentPage - 1)
+                            }
+                            .disabled(currentPage == 0)
+
+                            Spacer()
+
+                            Text("\(currentPage + 1) / \(totalPages)（\(startIdx + 1)〜\(endIdx)件 / 全\(totalCount)件）")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+
+                            Spacer()
+
+                            Button(model.t("次へ", "Next")) {
+                                model.historyPageIndex = min(totalPages - 1, currentPage + 1)
+                            }
+                            .disabled(currentPage >= totalPages - 1)
+                        }
+                        .padding(.top, 4)
                     }
                 }
             }
             .padding(8)
         } label: {
             HStack {
-                Text(model.t("取得履歴 (\(model.urlFetchHistory.count)件)", "Fetch History (\(model.urlFetchHistory.count))"))
+                Text(model.t("取得履歴 (\(totalCount)件)", "Fetch History (\(totalCount))"))
                 Spacer()
-                Button(model.t("履歴を消去", "Clear History")) {
+                Button(model.t("履歴を全消去", "Clear All History")) {
                     model.clearURLFetchHistory()
                 }
                 .disabled(model.urlFetchHistory.isEmpty)
@@ -3259,62 +3297,7 @@ struct ContentView: View {
 
                 dashboardRuntimeBox
 
-                GroupBox {
-                    let recent = model.recentPDFs
-                    if recent.isEmpty {
-                        Text(model.t("最近のPDFはありません。", "No recent PDFs."))
-                            .foregroundStyle(.secondary)
-                            .padding(8)
-                    } else {
-                        VStack(spacing: 0) {
-                            ForEach(Array(recent.enumerated()), id: \.element) { idx, pdf in
-                                HStack {
-                                    Label(pdf.lastPathComponent, systemImage: "doc.richtext")
-                                        .lineLimit(1)
-                                        .truncationMode(.middle)
-                                    Spacer()
-                                    if let historyEntry = model.historyItem(forPDF: pdf) {
-                                        Button(model.t("再ダウンロード", "Re-download")) {
-                                            model.redownloadFromHistory(historyEntry)
-                                        }
-                                    }
-                                    Button(model.t("開く", "Open")) { NSWorkspace.shared.open(pdf) }
-                                    Button(model.t("音声変換へ", "Convert to Audio")) {
-                                        model.ebookURL = pdf
-                                        destination = .audioLab
-                                    }
-                                    Button {
-                                        model.hideRecentPDF(pdf)
-                                    } label: {
-                                        Label(model.t("履歴から削除", "Remove from History"), systemImage: "xmark.circle")
-                                            .labelStyle(.iconOnly)
-                                    }
-                                    .help(model.t("履歴から削除（PDFは残す）", "Remove from history without deleting the PDF"))
-                                    .accessibilityLabel(model.t("\(pdf.lastPathComponent)を履歴から削除", "Remove \(pdf.lastPathComponent) from history"))
-                                }
-                                .padding(.vertical, 6)
-                                if idx < recent.count - 1 { Divider() }
-                            }
-                        }
-                    }
-                } label: {
-                    HStack {
-                        Text(model.t("最近のPDF", "Recent PDFs"))
-                        Spacer()
-                        Button(model.t("履歴を消去", "Clear History")) { confirmClearRecentPDFs = true }
-                            .disabled(model.recentPDFs.isEmpty)
-                    }
-                }
-                .confirmationDialog(
-                    model.t("最近のPDF履歴を消去しますか？", "Clear recent PDF history?"),
-                    isPresented: $confirmClearRecentPDFs,
-                    titleVisibility: .visible
-                ) {
-                    Button(model.t("履歴を消去", "Clear History"), role: .destructive) { model.clearRecentPDFs() }
-                    Button(model.t("キャンセル", "Cancel"), role: .cancel) {}
-                } message: {
-                    Text(model.t("元のPDFファイルは残ります。", "The original PDF files will remain."))
-                }
+                fetchHistorySection
             }
             .padding(28)
         }

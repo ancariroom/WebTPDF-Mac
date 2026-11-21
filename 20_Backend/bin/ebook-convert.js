@@ -35,7 +35,7 @@ async function main() {
     }
 
     const parser = new argparse.ArgumentParser({
-        description: 'EbookConverter - Ebook to PDF conversion tool. Use `local-pdf` for local EPUB/image conversion or `audiobook` for ebook2audiobook.'
+        description: 'WebTPDF - Ebook to PDF conversion tool. Use `local-pdf` for local EPUB/image conversion or `audiobook` for ebook2audiobook.'
     });
     parser.add_argument('--id', { help: 'Book ID (site-specific)' });
     parser.add_argument('--start', { type: 'int', default: 1, help: 'Start page' });

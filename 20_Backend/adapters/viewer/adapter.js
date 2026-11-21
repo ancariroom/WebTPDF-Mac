@@ -1,5 +1,5 @@
 /**
- * Viewer adapter for EbookConverter.
+ * Viewer adapter for WebTPDF.
  * Handles interactions with the Apryse WebViewer used by the target site.
  */
 class ViewerAdapter {

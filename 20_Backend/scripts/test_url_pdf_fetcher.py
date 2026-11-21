@@ -6,6 +6,7 @@ from __future__ import annotations
 import functools
 import http.server
 import io
+import json
 import socketserver
 import sys
 import tempfile
@@ -260,6 +261,20 @@ class UrlPdfFetcherTests(unittest.TestCase):
                 fetcher.fetch_via_browser(url, output, 28, 10, kindle_checkpoint=checkpoint)
             self.assertEqual(len(checkpoint.load()), 24)
             self.assertFalse(output.exists())
+
+            report = self.root / "result.json"
+            args = [
+                "url_pdf_fetcher", "--url", url, "--output", str(output),
+                "--max-pages", "24", "--kindle-checkpoint", str(checkpoint.path),
+                "--result-json", str(report),
+            ]
+            with patch.object(sys, "argv", args):
+                self.assertEqual(fetcher.main(), 1)
+            status = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual((status["pageCount"], status["expectedPages"]), (24, 28))
+            self.assertIn("上限", status["message"])
+            self.assertFalse(output.exists())
+            self.assertEqual(len(checkpoint.load()), 24)
 
             # Simulate pressing Re-download. A second transient error exercises
             # automatic recovery after the saved pages have been reloaded.

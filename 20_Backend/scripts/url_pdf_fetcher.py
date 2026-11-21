@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import io
+import json
 import re
 import sqlite3
 import sys
@@ -821,6 +822,29 @@ def verify_exported_pdf(
         doc.close()
 
 
+class IncompleteKindleCapture(RuntimeError):
+    def __init__(self, message: str, page_count: int, expected_pages: int | None):
+        super().__init__(message)
+        self.page_count = page_count
+        self.expected_pages = expected_pages
+
+
+def check_kindle_completeness(
+    page_count: int,
+    expected_pages: int | None,
+    last_page: int | None,
+    last_percent: int | None,
+    max_pages: int,
+) -> None:
+    if expected_pages is not None:
+        incomplete = page_count < expected_pages or (last_page is not None and last_page < expected_pages)
+    else:
+        incomplete = last_percent is not None and last_percent < 95
+    if incomplete:
+        message = "最大ページ数に達しました。上限を増やしてください。" if page_count >= max_pages else "本の最後まで取得できませんでした。"
+        raise IncompleteKindleCapture(message, page_count, expected_pages)
+
+
 @dataclass(frozen=True)
 class KindleCapture:
     pdf: bytes
@@ -1469,8 +1493,9 @@ def fetch_via_browser(
                     dismiss_kindle_dialogs(page)
                     if needs_recovery or is_kindle_oops(page):
                         if recovery_attempts >= 3:
-                            raise RuntimeError(
-                                f"Kindleのエラーから復旧できませんでした（取得済み: {page_idx - 1} ページ）。"
+                            raise IncompleteKindleCapture(
+                                f"Kindleのエラーから復旧できませんでした（取得済み: {page_idx - 1} ページ）。",
+                                page_idx - 1, expected_total_pages,
                             )
                         recovery_attempts += 1
                         log(f"[Kindle] Recovering before capture {page_idx} ({recovery_attempts}/3)...")
@@ -1708,10 +1733,13 @@ def fetch_via_browser(
             if not kindle_mode and captured_pdfs and len(captured_pdfs) >= len(collected_page_pdfs):
                 written = merge_pdf_bytes_list(captured_pdfs, resolved_output)
             elif kindle_mode and kindle_checkpoint is not None:
-                # Publish only the complete PDF, leaving the checkpoint intact if merging fails.
+                resolved_output.parent.mkdir(parents=True, exist_ok=True)
                 with tempfile.TemporaryDirectory(dir=resolved_output.parent) as folder:
                     staged_output = Path(folder) / resolved_output.name
                     written = merge_pdf_bytes_list(collected_page_pdfs, staged_output)
+                    check_kindle_completeness(
+                        written, expected_total_pages, last_kindle_page, last_kindle_percent, max_pages,
+                    )
                     staged_output.replace(resolved_output)
             else:
                 written = merge_pdf_bytes_list(collected_page_pdfs, resolved_output)
@@ -1802,6 +1830,7 @@ def main() -> int:
     parser.add_argument("--no-browser", action="store_true", help="Disable Playwright browser fallback")
     parser.add_argument("--auto-name", action="store_true", help="Auto-name output as <Title>_<YYYYMMDD>.pdf when available")
     parser.add_argument("--kindle-checkpoint", type=Path, help="Save and resume captured Kindle pages")
+    parser.add_argument("--result-json", type=Path, help="Write the output path and page count for the app")
     args = parser.parse_args()
 
     output_path = Path(args.output).expanduser().resolve()
@@ -1861,9 +1890,20 @@ def main() -> int:
                 auto_name=args.auto_name,
             )
     except Exception as exc:
+        if args.result_json and isinstance(exc, IncompleteKindleCapture):
+            args.result_json.write_text(json.dumps({
+                "pageCount": exc.page_count,
+                "expectedPages": exc.expected_pages,
+                "message": str(exc),
+            }), encoding="utf-8")
         print(f"Error: {exc}", file=sys.stderr, flush=True)
         return 1
 
+    if args.result_json:
+        args.result_json.write_text(json.dumps({
+            "outputPath": str(final_path),
+            "pageCount": total_pages,
+        }), encoding="utf-8")
     log(f"OUTPUT_PDF={final_path}")
     log(f"PAGES={total_pages}")
     return 0

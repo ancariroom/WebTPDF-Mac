@@ -154,6 +154,21 @@ final class AppModel: ObservableObject {
         let outputPath: String?
         let succeeded: Bool
         let errorMessage: String?
+        let pageCount: Int?
+        let expectedPages: Int?
+    }
+
+    private struct URLFetchResult: Decodable, Sendable {
+        let outputPath: String?
+        let pageCount: Int
+        let expectedPages: Int?
+        let message: String?
+    }
+
+    private struct URLFetchInterrupted: LocalizedError, Sendable {
+        let result: URLFetchResult
+        let message: String
+        var errorDescription: String? { message }
     }
 
     struct RuntimeCheckItem: Identifiable {
@@ -688,7 +703,9 @@ final class AppModel: ObservableObject {
         direction: PageTurnDirection,
         outputURL: URL?,
         succeeded: Bool,
-        errorMessage: String? = nil
+        errorMessage: String? = nil,
+        pageCount: Int? = nil,
+        expectedPages: Int? = nil
     ) {
         let entry = URLFetchHistoryItem(
             id: UUID(),
@@ -697,7 +714,9 @@ final class AppModel: ObservableObject {
             timestamp: Date(),
             outputPath: outputURL?.path,
             succeeded: succeeded,
-            errorMessage: errorMessage
+            errorMessage: errorMessage,
+            pageCount: pageCount,
+            expectedPages: expectedPages
         )
         urlFetchHistory.removeAll { $0.url == url && $0.direction == direction }
         urlFetchHistory.insert(entry, at: 0)
@@ -811,7 +830,7 @@ final class AppModel: ObservableObject {
                 self.appendLog("\n[Queue #\(processedCount)] (\(item.direction.label)) \(item.url)\n")
 
                 do {
-                    let mergedURL = try await self.performURLFetch(urlString: item.url, direction: item.direction)
+                    let (mergedURL, pageCount) = try await self.performURLFetch(urlString: item.url, direction: item.direction)
                     if self.cancelRequested {
                         self.pdfQueue[nextIndex].status = .pending
                         break
@@ -822,7 +841,7 @@ final class AppModel: ObservableObject {
                     self.fetchedPDFURL = mergedURL
                     self.fetchedFromSourceURL = item.url
                     self.outputDirectory = mergedURL.deletingLastPathComponent()
-                    self.recordURLFetchHistory(url: item.url, direction: item.direction, outputURL: mergedURL, succeeded: true)
+                    self.recordURLFetchHistory(url: item.url, direction: item.direction, outputURL: mergedURL, succeeded: true, pageCount: pageCount)
                     self.appendLog("[Queue #\(processedCount)] Saved -> \(mergedURL.path)\n")
                 } catch {
                     if self.cancelRequested {
@@ -831,7 +850,11 @@ final class AppModel: ObservableObject {
                     }
                     self.pdfQueue[nextIndex].status = .failed
                     self.pdfQueue[nextIndex].errorMessage = error.localizedDescription
-                    self.recordURLFetchHistory(url: item.url, direction: item.direction, outputURL: nil, succeeded: false, errorMessage: error.localizedDescription)
+                    let result = (error as? URLFetchInterrupted)?.result
+                    self.recordURLFetchHistory(
+                        url: item.url, direction: item.direction, outputURL: nil, succeeded: false,
+                        errorMessage: error.localizedDescription, pageCount: result?.pageCount, expectedPages: result?.expectedPages
+                    )
                     self.appendLog("[Queue #\(processedCount)] Failed: \(error.localizedDescription)\n")
                 }
             }
@@ -891,7 +914,7 @@ final class AppModel: ObservableObject {
             }
 
             do {
-                let mergedURL = try await self.performURLFetch(urlString: urlString)
+                let (mergedURL, pageCount) = try await self.performURLFetch(urlString: urlString)
                 self.preflightTask = nil
                 self.isFetchingURL = false
                 self.stopProgressClock()
@@ -909,7 +932,7 @@ final class AppModel: ObservableObject {
                 self.progressText = "100%"
                 self.remainingText = "00:00"
                 self.refreshLibraryPDFs()
-                self.recordURLFetchHistory(url: urlString, direction: pageTurnDirection, outputURL: mergedURL, succeeded: true)
+                self.recordURLFetchHistory(url: urlString, direction: pageTurnDirection, outputURL: mergedURL, succeeded: true, pageCount: pageCount)
                 self.appendLog("\nMerged PDF saved to: \(mergedURL.path)\n")
                 self.sendCompletionNotification(
                     title: self.t("PDF作成完了", "PDF Created"),
@@ -929,7 +952,11 @@ final class AppModel: ObservableObject {
                     )
                     self.finishCanceledPreflight()
                 } else {
-                    self.recordURLFetchHistory(url: urlString, direction: self.pageTurnDirection, outputURL: nil, succeeded: false, errorMessage: error.localizedDescription)
+                    let result = (error as? URLFetchInterrupted)?.result
+                    self.recordURLFetchHistory(
+                        url: urlString, direction: self.pageTurnDirection, outputURL: nil, succeeded: false,
+                        errorMessage: error.localizedDescription, pageCount: result?.pageCount, expectedPages: result?.expectedPages
+                    )
                     self.fail(error.localizedDescription)
                 }
                 self.startQueueIfAutoRunEnabled()
@@ -1965,7 +1992,7 @@ final class AppModel: ObservableObject {
         return nil
     }
 
-    private func performURLFetch(urlString: String, direction: PageTurnDirection? = nil) async throws -> URL {
+    private func performURLFetch(urlString: String, direction: PageTurnDirection? = nil) async throws -> (URL, Int) {
         guard let parsed = URL(string: urlString),
               let scheme = parsed.scheme?.lowercased(),
               scheme == "http" || scheme == "https",
@@ -2002,6 +2029,9 @@ final class AppModel: ObservableObject {
             checkpointURL = nil
         }
 
+        let resultURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WebTPDF-\(UUID().uuidString).json")
+
         return try await withCheckedThrowingContinuation { continuation in
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: pythonCommand)
@@ -2013,6 +2043,7 @@ final class AppModel: ObservableObject {
                 "--direction", resolvedDirection.rawValue,
                 "--max-pages", String(max(1, maxPages)),
                 "--auto-name",
+                "--result-json", resultURL.path,
             ]
             if let checkpointURL {
                 arguments += ["--kindle-checkpoint", checkpointURL.path]
@@ -2026,21 +2057,6 @@ final class AppModel: ObservableObject {
             proc.environment = environment
 
             let pipe = Pipe()
-            final class OutputPathBox: @unchecked Sendable {
-                private let lock = NSLock()
-                private var value: String?
-                func set(_ newValue: String) {
-                    lock.lock()
-                    value = newValue
-                    lock.unlock()
-                }
-                func get() -> String? {
-                    lock.lock()
-                    defer { lock.unlock() }
-                    return value
-                }
-            }
-            let resolvedOutputPath = OutputPathBox()
             proc.standardOutput = pipe
             proc.standardError = pipe
             pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -2048,26 +2064,8 @@ final class AppModel: ObservableObject {
                 guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else {
                     return
                 }
-                var qualitySummary: String?
-                for line in chunk.components(separatedBy: .newlines) {
-                    if line.hasPrefix("OUTPUT_PDF=") {
-                        let candidate = String(line.dropFirst("OUTPUT_PDF=".count)).trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !candidate.isEmpty {
-                            resolvedOutputPath.set(candidate)
-                        }
-                    } else if line.hasPrefix("QUALITY_CHECK=") {
-                        let summary = String(line.dropFirst("QUALITY_CHECK=".count)).trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !summary.isEmpty {
-                            qualitySummary = summary
-                        }
-                    }
-                }
-                let capturedQuality = qualitySummary
                 Task { @MainActor in
                     self?.appendLog(chunk)
-                    if let capturedQuality {
-                        self?.statusMessage = "PDF検証: \(capturedQuality)"
-                    }
                 }
             }
 
@@ -2075,12 +2073,24 @@ final class AppModel: ObservableObject {
                 pipe.fileHandleForReading.readabilityHandler = nil
                 Task { @MainActor in
                     self?.fetchProcess = nil
-                    let finalURL = resolvedOutputPath.get().map { URL(fileURLWithPath: $0) } ?? outputURL
-                    if terminated.terminationStatus == 0,
-                       FileManager.default.fileExists(atPath: finalURL.path) {
-                        continuation.resume(returning: finalURL)
-                    } else if self?.cancelRequested == true {
+                    let result = (try? Data(contentsOf: resultURL)).flatMap {
+                        try? JSONDecoder().decode(URLFetchResult.self, from: $0)
+                    }
+                    try? FileManager.default.removeItem(at: resultURL)
+                    if self?.cancelRequested == true {
                         continuation.resume(throwing: UserVisibleError(message: "Canceled"))
+                    } else if terminated.terminationStatus == 0,
+                              let result, let path = result.outputPath,
+                              FileManager.default.fileExists(atPath: path) {
+                        continuation.resume(returning: (URL(fileURLWithPath: path), result.pageCount))
+                    } else if let result, let reason = result.message {
+                        let canResume = checkpointURL.map {
+                            FileManager.default.fileExists(atPath: $0.path)
+                        } ?? false
+                        let retry = canResume
+                            ? (self?.t(" 履歴の「再ダウンロード」で再開できます。", " Use Re-download in history to resume.") ?? "")
+                            : ""
+                        continuation.resume(throwing: URLFetchInterrupted(result: result, message: reason + retry))
                     } else if let checkpointURL, FileManager.default.fileExists(atPath: checkpointURL.path) {
                         let message = self?.t(
                             "取得が中断されました。履歴の「再ダウンロード」で続きから再開します。",
@@ -2969,12 +2979,18 @@ struct ContentView: View {
                                     .truncationMode(.middle)
                                 HStack(spacing: 8) {
                                     Text(entry.direction.label)
+                                    if let count = entry.pageCount {
+                                        let pages = entry.expectedPages.map { "\(count)/\($0)" } ?? "\(count)"
+                                        Text(model.t("\(pages) ページ", "\(pages) pages"))
+                                            .monospacedDigit()
+                                    }
                                     if let path = entry.outputPath {
                                         Text(URL(fileURLWithPath: path).lastPathComponent)
                                             .lineLimit(1)
                                             .truncationMode(.middle)
                                     } else if let err = entry.errorMessage {
                                         Text(err)
+                                            .help(err)
                                             .lineLimit(1)
                                             .truncationMode(.tail)
                                     }

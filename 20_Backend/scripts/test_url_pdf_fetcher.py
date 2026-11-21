@@ -307,6 +307,11 @@ class UrlPdfFetcherTests(unittest.TestCase):
                 same_tab = recover.call_args_list[0].args[0]
                 self.assertTrue(recover.call_args.kwargs["fresh_tab"])
                 self.assertIsNot(recover.call_args.args[0], same_tab)
+                for attempt in recover.call_args_list[-4:-1]:
+                    self.assertTrue(attempt.kwargs["use_location"])
+                    self.assertIsNone(attempt.kwargs["toc_offset"])
+                self.assertFalse(recover.call_args.kwargs["use_location"])
+                self.assertEqual(recover.call_args.kwargs["toc_offset"], 1)
             status = json.loads(report.read_text(encoding="utf-8"))
 
         self.assertEqual((status["pageCount"], status["expectedPages"]), (28, 28))
@@ -327,6 +332,7 @@ class UrlPdfFetcherTests(unittest.TestCase):
                 page.set_content("""
                     <button id="more" aria-label="More options">⋮</button>
                     <button id="location-menu" hidden>Go to Location</button>
+                    <button id="page-menu" hidden>Go to Page</button>
                     <section id="dialog" hidden>
                       <h2>Go to Location</h2>
                       <label>Go to location <input type="number" placeholder="location"> of 499</label>
@@ -339,6 +345,9 @@ class UrlPdfFetcherTests(unittest.TestCase):
                       const input = document.querySelector('input');
                       const image = document.querySelector('img');
                       window.visitedLocations = [];
+                      window.visitedPages = [];
+                      window.pageMenuAvailable = false;
+                      let targetIsPage = false;
                       function render(position) {
                         const canvas = document.createElement('canvas');
                         canvas.toBlob((blob) => {
@@ -347,16 +356,24 @@ class UrlPdfFetcherTests(unittest.TestCase):
                             'Page ' + (1 + Math.floor(position / 10)) + ' of 50';
                         });
                       }
-                      byId('more').onclick = () => byId('location-menu').hidden = false;
-                      byId('location-menu').onclick = () => {
-                        byId('location-menu').hidden = true;
-                        byId('dialog').hidden = false;
+                      byId('more').onclick = () => {
+                        byId('location-menu').hidden = false;
+                        byId('page-menu').hidden = !window.pageMenuAvailable;
                       };
+                      function openDialog(usePage) {
+                        targetIsPage = usePage;
+                        byId('location-menu').hidden = true;
+                        byId('page-menu').hidden = true;
+                        document.querySelector('h2').textContent = usePage ? 'Go to Page' : 'Go to Location';
+                        byId('dialog').hidden = false;
+                      }
+                      byId('location-menu').onclick = () => openDialog(false);
+                      byId('page-menu').onclick = () => openDialog(true);
                       byId('go').onclick = () => {
-                        const position = Number(input.value);
-                        window.visitedLocations.push(position);
+                        const number = Number(input.value);
+                        (targetIsPage ? window.visitedPages : window.visitedLocations).push(number);
                         byId('dialog').hidden = true;
-                        render(position);
+                        render(targetIsPage ? (number - 1) * 10 : number);
                       };
                       byId('cancel').onclick = () => byId('dialog').hidden = true;
                       render(10);
@@ -370,6 +387,13 @@ class UrlPdfFetcherTests(unittest.TestCase):
                 entered = page.evaluate("window.visitedLocations")
                 self.assertGreater(len(entered), 1)
                 self.assertNotIn(24, entered)
+
+                # Typing is still attempted if a reopen already shows the saved
+                # page number. The direct page field wins when both are offered.
+                page.evaluate("window.pageMenuAvailable = true")
+                self.assertTrue(fetcher.seek_kindle_position(page, position, target_is_printed_page=True))
+                self.assertEqual(page.evaluate("window.visitedPages"), [position])
+                self.assertEqual(page.evaluate("window.visitedLocations"), entered)
             finally:
                 browser.close()
 

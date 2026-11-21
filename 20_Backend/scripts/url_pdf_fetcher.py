@@ -1044,72 +1044,103 @@ def jump_to_kindle_chapter(page, offset: int) -> bool:
             button.click(timeout=2000)
 
 
-KINDLE_GO_TO_NAME = re.compile(r"^(?:Go to Location|位置(?:番号)?へ移動)$", re.IGNORECASE)
+KINDLE_GO_TO_PAGE = re.compile(r"^(?:Go to Page|ページ[へに]移動)$", re.IGNORECASE)
+KINDLE_GO_TO_LOCATION = re.compile(r"^(?:Go to Location|位置(?:番号)?[へに]移動)$", re.IGNORECASE)
 
 
-def open_kindle_location_dialog(page):
-    """Find Go to Location through the reader's visible menu."""
-    entry = page.get_by_text(KINDLE_GO_TO_NAME, exact=True).filter(visible=True).first
-    if not entry.is_visible():
-        menu_name = re.compile(r"^(?:More(?: options| menu| actions| settings)?|その他(?:のオプション)?|詳細(?:設定)?|メニュー)$", re.I)
-        more = page.get_by_role("button", name=menu_name).or_(
-            page.locator("#kr-more, #kr-more-menu, #kr-more-menu-button, #kr-more-settings, [data-testid='more-button']")
-        ).filter(visible=True).first
-        if not more.is_visible():
+def open_kindle_number_dialog(page, prefer_page: bool):
+    """Prefer the reader's direct page field when it is available."""
+    location = page.get_by_text(KINDLE_GO_TO_LOCATION, exact=True).filter(visible=True).first
+    printed_page = page.get_by_text(KINDLE_GO_TO_PAGE, exact=True).filter(visible=True).first
+    available = printed_page.or_(location) if prefer_page else location
+    if not available.first.is_visible():
+        menu_name = re.compile(
+            r"^(?:More(?: options| menu| actions| settings)?|Menu|Options|その他(?:のオプション)?|詳細(?:設定)?|メニュー|⋮)$",
+            re.I,
+        )
+        menus = page.get_by_role("button", name=menu_name).or_(
+            page.locator(
+                "#kr-more, #kr-more-menu, #kr-more-menu-button, #kr-more-settings, "
+                "[data-testid='more-button'], button[aria-haspopup='menu'], [role='button'][aria-haspopup='menu']"
+            )
+        ).filter(visible=True)
+        for menu in menus.all()[:4]:
+            menu.click(timeout=1500)
+            try:
+                available.first.wait_for(state="visible", timeout=900)
+                break
+            except Exception:
+                if menu.is_visible() and menu.get_attribute("aria-expanded") == "true":
+                    menu.click(timeout=1500)
+                else:
+                    page.keyboard.press("Escape")
+        else:
             return None
-        more.click(timeout=2000)
-        try:
-            entry.wait_for(state="visible", timeout=1500)
-        except Exception:
-            if more.is_visible():
-                more.click(timeout=1500)
-            return None
+
+    if prefer_page and printed_page.is_visible():
+        kind, entry, label = "page", printed_page, KINDLE_GO_TO_PAGE
+    elif location.is_visible():
+        kind, entry, label = "location", location, KINDLE_GO_TO_LOCATION
+    else:
+        return None
     entry.click(timeout=2000)
-    heading = page.get_by_text(KINDLE_GO_TO_NAME, exact=True).filter(visible=True).last
+    heading = page.get_by_text(label, exact=True).filter(visible=True).last
     heading.wait_for(state="visible", timeout=2000)
     panel = heading.locator("xpath=..")
     for _ in range(4):
         if panel.evaluate("node => node === document.body || node === document.documentElement"):
-            return None
-        field = panel.locator("input[type=number], input[placeholder='location' i]").filter(visible=True)
+            break
+        field = panel.locator("input[type=number], input[placeholder='location' i], input[placeholder='page' i]").filter(visible=True)
         go = panel.get_by_role("button", name=re.compile(r"^(?:Go|移動)$", re.I)).filter(visible=True)
         if field.count() == 1 and go.count() == 1:
-            return panel, field, go
+            return kind, panel, field, go
         panel = panel.locator("xpath=..")
+    page.keyboard.press("Escape")
     return None
 
 
-def seek_kindle_position(page, target: int, target_is_printed_page: bool) -> None:
-    """Use location as a seek hint, leaving verification to the checkpoint matcher."""
-    starting_position = get_kindle_position(page)
-    if not starting_position:
-        return
-    kind, current = starting_position
-    if kind != ("page" if target_is_printed_page else "location") or current == target:
-        return
-
+def seek_kindle_position(page, target: int, target_is_printed_page: bool) -> bool:
+    """Navigate by number first; the caller still verifies the saved screenshot."""
     low, high = 1, None
-    # Printed page labels and location numbers are different units. When the
-    # footer shows pages, bracket the target by observing where each live jump lands.
     for _ in range(13 if target_is_printed_page else 1):
-        dialog = open_kindle_location_dialog(page)
+        before = get_kindle_position(page)
+        dialog = open_kindle_number_dialog(page, prefer_page=target_is_printed_page)
         if dialog is None:
-            return
-        panel, field, go = dialog
+            log("[Kindle] No usable Go to Page or Go to Location dialog was found.")
+            return False
+        kind, panel, field, go = dialog
         try:
-            if high is None:
-                maximum = field.get_attribute("max", timeout=1000)
-                if not maximum or not maximum.isdigit():
-                    bounds = re.search(r"(?:\bof\s+|全\s*)([\d,]+)", panel.inner_text(timeout=1000), re.I)
-                    maximum = bounds.group(1).replace(",", "") if bounds else None
-                if not maximum or int(maximum) < 1:
-                    return
-                high = int(maximum)
-            if low > high or (not target_is_printed_page and target > high):
-                return
-            location = (low + high) // 2 if target_is_printed_page else target
+            same_position = before == (kind, target)
+            if kind == "page" or not target_is_printed_page:
+                number = target
+            elif before and before[0] == "page":
+                # The input is in locations even though the checkpoint stores a printed page.
+                # Re-enter the location shown for this page when we are already on the label.
+                label = panel.inner_text(timeout=1500)
+                current_location = re.search(r"(?:on location|現在の位置[:：]?)\s*(\d[\d,]*)", label, re.I)
+                if before == ("page", target) and current_location:
+                    number = int(current_location.group(1).replace(",", ""))
+                    same_position = True
+                else:
+                    if high is None:
+                        maximum = field.get_attribute("max", timeout=1000)
+                        if not maximum or not maximum.isdigit():
+                            bounds = re.search(r"(?:\bof\s+|全\s*)(\d[\d,]*)", label, re.I)
+                            maximum = bounds.group(1).replace(",", "") if bounds else None
+                        if not maximum or int(maximum) < 1:
+                            log("[Kindle] The maximum location number is unavailable.")
+                            return False
+                        high = int(maximum)
+                    if low > high:
+                        return False
+                    number = (low + high) // 2
+            else:
+                log("[Kindle] The reader has no printed page label to compare with the saved page.")
+                return False
+
             previous_source = page.evaluate(KINDLE_PAGE_SOURCE)
-            field.fill(str(location), timeout=1500)
+            log(f"[Kindle] Entering {kind} number {number} to recover the saved position.")
+            field.fill(str(number), timeout=1500)
             go.click(timeout=2000)
             field.wait_for(state="hidden", timeout=2000)
         finally:
@@ -1117,18 +1148,24 @@ def seek_kindle_position(page, target: int, target_is_printed_page: bool) -> Non
                 cancel = panel.get_by_role("button", name=re.compile(r"^(?:Cancel|キャンセル)$", re.I)).first
                 if cancel.is_visible():
                     cancel.click(timeout=1500)
-        if not wait_for_kindle_turn(page, previous_source, timeout_ms=3500):
-            return
+
+        changed = wait_for_kindle_turn(page, previous_source, timeout_ms=1000 if same_position else 3500)
+        if not changed and (not same_position or is_kindle_oops(page)):
+            return False
         actual = get_kindle_position(page)
-        if actual is None or actual[0] != kind:
-            return
-        log(f"[Kindle] Go to Location {location} reached {kind} {actual[1]}.")
-        if not target_is_printed_page or abs(actual[1] - target) <= 1:
-            return
+        if actual:
+            log(f"[Kindle] Number navigation reached {actual[0]} {actual[1]}.")
+        if kind == "page" or not target_is_printed_page or same_position:
+            return True
+        if actual is None or actual[0] != "page":
+            return False
+        if abs(actual[1] - target) <= 1:
+            return True
         if actual[1] < target:
-            low = location + 1
+            low = number + 1
         else:
-            high = location - 1
+            high = number - 1
+    return False
 
 
 def reopen_kindle_from_library(page, start_url: str, book_title: str | None) -> bool:
@@ -1211,6 +1248,7 @@ def recover_kindle_oops(
 
         if use_location and last_kindle_page is not None and last_image_hash is not None:
             try:
+                log("[Kindle] Trying number navigation before page turns or table of contents...")
                 seek_kindle_position(page, last_kindle_page, expected_total_pages is not None)
             except Exception as exc:
                 log(f"[Kindle] Go to Location unavailable ({type(exc).__name__}).")
@@ -1767,9 +1805,9 @@ def fetch_via_browser(
                         recovery_options = dict(
                             captured_count=page_idx - 1,
                             last_image_hash=last_kindle_image_hash,
-                            toc_offset={3: 1, 4: 0}.get(recovery_attempts),
+                            toc_offset=1 if recovery_attempts == 4 else None,
                             book_title=book_title,
-                            use_location=recovery_attempts in (1, 2),
+                            use_location=recovery_attempts < 4,
                             expected_total_pages=expected_total_pages,
                         )
                         if recovery_attempts == 1:

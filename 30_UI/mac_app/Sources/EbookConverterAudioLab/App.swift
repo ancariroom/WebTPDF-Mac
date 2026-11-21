@@ -704,6 +704,16 @@ final class AppModel: ObservableObject {
         saveURLFetchHistory()
     }
 
+    func historyItem(forPDF pdfURL: URL) -> URLFetchHistoryItem? {
+        let targetPath = pdfURL.standardizedFileURL.path
+        return urlFetchHistory.first { item in
+            guard let outputPath = item.outputPath, !outputPath.isEmpty else { return false }
+            let itemURL = URL(fileURLWithPath: outputPath)
+            return itemURL.standardizedFileURL.path == targetPath
+                || itemURL.lastPathComponent == pdfURL.lastPathComponent
+        }
+    }
+
     func redownloadFromHistory(_ item: URLFetchHistoryItem) {
         pdfQueue.append(PDFQueueItem(url: item.url, direction: item.direction))
         isQueueAutoPaused = false
@@ -3258,6 +3268,11 @@ struct ContentView: View {
                                         .lineLimit(1)
                                         .truncationMode(.middle)
                                     Spacer()
+                                    if let historyEntry = model.historyItem(forPDF: pdf) {
+                                        Button(model.t("再ダウンロード", "Re-download")) {
+                                            model.redownloadFromHistory(historyEntry)
+                                        }
+                                    }
                                     Button(model.t("開く", "Open")) { NSWorkspace.shared.open(pdf) }
                                     Button(model.t("音声変換へ", "Convert to Audio")) {
                                         model.ebookURL = pdf
@@ -3480,6 +3495,11 @@ struct ContentView: View {
                                         .lineLimit(1)
                                         .truncationMode(.middle)
                                     Spacer()
+                                    if let historyEntry = model.historyItem(forPDF: pdf) {
+                                        Button(model.t("再ダウンロード", "Re-download")) {
+                                            model.redownloadFromHistory(historyEntry)
+                                        }
+                                    }
                                     Button(model.t("開く", "Open")) { NSWorkspace.shared.open(pdf) }
                                     Button("Finder") {
                                         NSWorkspace.shared.activateFileViewerSelecting([pdf])

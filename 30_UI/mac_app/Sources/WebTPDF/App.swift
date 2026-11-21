@@ -2456,6 +2456,25 @@ final class AppModel: ObservableObject {
     }
 }
 
+private struct VisibleScrollView<Content: View>: View {
+    let content: Content
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+    var body: some View {
+        if #available(macOS 13.0, *) {
+            ScrollView(.vertical, showsIndicators: true) {
+                content
+            }
+            .scrollIndicators(.visible)
+        } else {
+            ScrollView(.vertical, showsIndicators: true) {
+                content
+            }
+        }
+    }
+}
+
 struct ContentView: View {
     enum Destination: String, CaseIterable, Identifiable {
         case runtime
@@ -2521,6 +2540,7 @@ struct ContentView: View {
     @State private var destination: Destination? = .dashboard
     @State private var settingsTab: SettingsTab = .general
     @State private var confirmClearRecentPDFs = false
+    @FocusState private var isSourceURLFocused: Bool
 
     var body: some View {
         NavigationSplitView {
@@ -2639,13 +2659,28 @@ struct ContentView: View {
     }
 
     private var urlToPDFView: some View {
-        ScrollView {
+        VisibleScrollView {
             VStack(alignment: .leading, spacing: 24) {
 
                 HStack(spacing: 12) {
-                    topologyCard(model.t("ソースURL", "Source URL"), symbol: "globe", detail: model.trimmedSourceURL.isEmpty ? model.t("未入力", "Empty") : model.t("入力済み", "Ready"))
+                    Button {
+                        isSourceURLFocused = true
+                    } label: {
+                        topologyCard(model.t("ソースURL", "Source URL"), symbol: "globe", detail: model.trimmedSourceURL.isEmpty ? model.t("未入力", "Empty") : model.t("入力済み", "Ready"))
+                    }
+                    .buttonStyle(.plain)
+                    .help(model.t("クリックしてURL入力欄にカーソルを移動", "Click to focus URL input"))
+
                     Image(systemName: "chevron.right").foregroundStyle(.secondary)
-                    topologyCard(model.t("ページ送り", "Pagination"), symbol: model.pageTurnDirection == .left ? "arrow.left.square" : "arrow.right.square", detail: model.pageTurnDirection.label)
+
+                    Button {
+                        model.pageTurnDirection = model.pageTurnDirection == .left ? .right : .left
+                    } label: {
+                        topologyCard(model.t("ページ送り", "Pagination"), symbol: model.pageTurnDirection == .left ? "arrow.left.square" : "arrow.right.square", detail: model.pageTurnDirection.label)
+                    }
+                    .buttonStyle(.plain)
+                    .help(model.t("クリックして右キー・左キーを切り替え", "Click to toggle Left/Right key"))
+
                     Image(systemName: "chevron.right").foregroundStyle(.secondary)
                     Button {
                         model.choosePDFSaveDirectory()
@@ -2667,6 +2702,7 @@ struct ContentView: View {
                                 .foregroundStyle(.secondary)
                             TextField("https://... (PDF / URL)", text: $model.sourceURLText)
                                 .textFieldStyle(.roundedBorder)
+                                .focused($isSourceURLFocused)
                         }
 
                         HStack(spacing: 8) {
@@ -2998,7 +3034,7 @@ struct ContentView: View {
     }
 
     private var audioLabView: some View {
-        ScrollView {
+        VisibleScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(model.t("電子書籍をオーディオブックに変換", "Convert Ebooks to Audiobooks"))
@@ -3062,7 +3098,7 @@ struct ContentView: View {
     }
 
     private var modelsView: some View {
-        ScrollView {
+        VisibleScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(model.t("AI接続の管理", "Manage AI Connections"))
@@ -3207,7 +3243,7 @@ struct ContentView: View {
     }
 
     private var runtimeView: some View {
-        ScrollView {
+        VisibleScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
@@ -3301,7 +3337,7 @@ struct ContentView: View {
     }
 
     private var dashboardView: some View {
-        ScrollView {
+        VisibleScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 HStack(spacing: 12) {
                     Button("URL → PDF 作成を開く") { destination = .urlToPDF }
@@ -3379,7 +3415,7 @@ struct ContentView: View {
     }
 
     private var pdfSqueezerView: some View {
-        ScrollView {
+        VisibleScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(model.t("PDF圧縮 (Squeezer)", "PDF Squeezer"))
@@ -3464,7 +3500,7 @@ struct ContentView: View {
     }
 
     private var libraryView: some View {
-        ScrollView {
+        VisibleScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 HStack {
                     VStack(alignment: .leading, spacing: 8) {
@@ -3547,7 +3583,7 @@ struct ContentView: View {
 
             switch settingsTab {
             case .general:
-                ScrollView {
+                VisibleScrollView {
                     VStack(alignment: .leading, spacing: 24) {
                         VStack(alignment: .leading, spacing: 8) {
                             Text("システム設定")
@@ -3580,7 +3616,7 @@ struct ContentView: View {
     }
 
     private var systemLogsView: some View {
-        ScrollView {
+        VisibleScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("環境・実行ログ")
@@ -3633,7 +3669,7 @@ struct ContentView: View {
     private func logBox(minHeight: CGFloat) -> some View {
         GroupBox(model.t("ログ", "Log")) {
             ScrollViewReader { proxy in
-                ScrollView(.vertical, showsIndicators: true) {
+                VisibleScrollView {
                     VStack(alignment: .leading, spacing: 0) {
                         Text(model.logText)
                             .font(.system(.caption, design: .monospaced))

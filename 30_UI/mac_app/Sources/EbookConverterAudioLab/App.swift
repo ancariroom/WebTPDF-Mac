@@ -1951,6 +1951,7 @@ final class AppModel: ObservableObject {
                 "--output", outputURL.path,
                 "--direction", resolvedDirection.rawValue,
                 "--max-pages", String(max(1, maxPages)),
+                "--auto-name",
             ]
             proc.currentDirectoryURL = fetchedPDFRoot
 
@@ -1960,12 +1961,35 @@ final class AppModel: ObservableObject {
             proc.environment = environment
 
             let pipe = Pipe()
+            final class OutputPathBox: @unchecked Sendable {
+                private let lock = NSLock()
+                private var value: String?
+                func set(_ newValue: String) {
+                    lock.lock()
+                    value = newValue
+                    lock.unlock()
+                }
+                func get() -> String? {
+                    lock.lock()
+                    defer { lock.unlock() }
+                    return value
+                }
+            }
+            let resolvedOutputPath = OutputPathBox()
             proc.standardOutput = pipe
             proc.standardError = pipe
             pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
                 let data = handle.availableData
                 guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else {
                     return
+                }
+                for line in chunk.components(separatedBy: .newlines) {
+                    if line.hasPrefix("OUTPUT_PDF=") {
+                        let candidate = String(line.dropFirst("OUTPUT_PDF=".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !candidate.isEmpty {
+                            resolvedOutputPath.set(candidate)
+                        }
+                    }
                 }
                 Task { @MainActor in
                     self?.appendLog(chunk)
@@ -1976,9 +2000,10 @@ final class AppModel: ObservableObject {
                 pipe.fileHandleForReading.readabilityHandler = nil
                 Task { @MainActor in
                     self?.fetchProcess = nil
+                    let finalURL = resolvedOutputPath.get().map { URL(fileURLWithPath: $0) } ?? outputURL
                     if terminated.terminationStatus == 0,
-                       FileManager.default.fileExists(atPath: outputURL.path) {
-                        continuation.resume(returning: outputURL)
+                       FileManager.default.fileExists(atPath: finalURL.path) {
+                        continuation.resume(returning: finalURL)
                     } else if self?.cancelRequested == true {
                         continuation.resume(throwing: UserVisibleError(message: "Canceled"))
                     } else {

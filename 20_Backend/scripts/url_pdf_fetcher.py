@@ -888,13 +888,116 @@ def check_access_denied(page, response_status: int | None) -> None:
         )
 
 
+def sanitize_filename(name: str, max_len: int = 120) -> str:
+    """Sanitize a book/page title for safe macOS PDF filenames."""
+    cleaned = re.sub(r'[\\/:*?"<>|\r\n\t]+', " ", name).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len].rstrip(" .")
+    return cleaned
+
+
+def extract_book_title_and_date(page) -> tuple[str | None, str | None]:
+    """Best-effort extraction of (title, YYYYMMDD) from O'Reilly, Kindle, or generic HTML pages."""
+    url = page.url or ""
+    # 1. O'Reilly Learning metadata API
+    m_oreilly = re.search(r"learning\.oreilly\.com/library/view/[^/]+/(\d+)", url)
+    if m_oreilly:
+        book_id = m_oreilly.group(1)
+        try:
+            meta = page.evaluate(
+                """async (bid) => {
+                    try {
+                        const r = await fetch('/api/v2/metadata/?identifier=' + encodeURIComponent(bid) + '&include_hidden=true');
+                        if (r.ok) {
+                            const d = await r.json();
+                            const item = (d.results || d || [])[0];
+                            if (item && item.name) {
+                                return { title: item.name, pub: (item.publication_date || '').slice(0, 10) };
+                            }
+                        }
+                    } catch (e) {}
+                    try {
+                        const r2 = await fetch('/api/v2/epubs/urn:orm:book:' + encodeURIComponent(bid) + '/');
+                        if (r2.ok) {
+                            const d2 = await r2.json();
+                            return { title: d2.title || null, pub: (d2.issued || d2.publication_date || '').slice(0, 10) };
+                        }
+                    } catch (e) {}
+                    return null;
+                }""",
+                book_id,
+            )
+            if isinstance(meta, dict) and meta.get("title"):
+                pub = re.sub(r"[^0-9]", "", str(meta.get("pub") or ""))
+                return str(meta["title"]), (pub[:8] if len(pub) >= 8 else None)
+        except Exception:
+            pass
+
+    # 2. Kindle Cloud Reader title & generic meta tags
+    try:
+        info = page.evaluate(
+            """() => {
+                const isKindle = location.hostname.includes('read.amazon.');
+                let title = '';
+                if (isKindle) {
+                    const lines = (document.body?.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);
+                    for (const line of lines) {
+                        if (line === 'Kindle Library' || line.startsWith('Page ') || line.includes('left in ')) continue;
+                        if (line.length >= 2) { title = line; break; }
+                    }
+                }
+                if (!title) {
+                    title = document.querySelector('meta[property="og:title"]')?.content || document.title || '';
+                }
+                const pubMeta = (
+                    document.querySelector('meta[property="article:published_time"]')?.content ||
+                    document.querySelector('meta[name="publication_date"]')?.content ||
+                    document.querySelector('meta[name="date"]')?.content ||
+                    ''
+                );
+                return { title, pubMeta };
+            }"""
+        )
+        if isinstance(info, dict):
+            title = str(info.get("title") or "").strip()
+            if title.lower() in {"kindle", "loading", ""}:
+                title = ""
+            pub_raw = str(info.get("pubMeta") or "")
+            m_date = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", pub_raw)
+            pub_str = f"{m_date.group(1)}{int(m_date.group(2)):02d}{int(m_date.group(3)):02d}" if m_date else None
+            return (title or None), pub_str
+    except Exception:
+        pass
+    return None, None
+
+
+def resolve_auto_output_path(base_output: Path, title: str | None, pub_date: str | None) -> Path:
+    """Build <dir>/<title>_<YYYYMMDD>.pdf (or <title>.pdf), avoiding collisions."""
+    safe_title = sanitize_filename(title or "")
+    if not safe_title:
+        return base_output
+    stem = f"{safe_title}_{pub_date}" if pub_date else safe_title
+    candidate = base_output.with_name(f"{stem}.pdf")
+    if candidate == base_output:
+        return candidate
+    if not candidate.exists():
+        return candidate
+    for idx in range(2, 100):
+        alt = base_output.with_name(f"{stem}_{idx}.pdf")
+        if not alt.exists():
+            return alt
+    return base_output
+
+
 def fetch_via_browser(
     start_url: str,
     output_path: Path,
     max_pages: int,
     timeout: int,
     direction: str = "right",
-) -> int:
+    auto_name: bool = False,
+) -> tuple[int, Path]:
     """Use CDP (logged-in Chrome) or headless Chromium to paginate with ArrowRight/ArrowLeft and capture PDFs."""
     from playwright.sync_api import sync_playwright
 
@@ -963,6 +1066,12 @@ def fetch_via_browser(
             log("[Browser] Waiting for page render...")
             wait_for_page_ready(page, timeout_ms=12000)
             check_access_denied(page, response_status)
+            resolved_output = output_path
+            if auto_name:
+                detected_title, detected_pub = extract_book_title_and_date(page)
+                resolved_output = resolve_auto_output_path(output_path, detected_title, detected_pub)
+                if resolved_output != output_path:
+                    log(f"[AutoName] Output filename -> {resolved_output.name}")
             kindle_mode = is_kindle_cloud_reader(page)
             if kindle_mode:
                 dismiss_kindle_dialogs(page)
@@ -975,7 +1084,7 @@ def fetch_via_browser(
 
             # 1. If a PDF was fetched via XHR/embed during load, merge and return
             if captured_pdfs:
-                return merge_pdf_bytes_list(captured_pdfs, output_path)
+                return merge_pdf_bytes_list(captured_pdfs, resolved_output), resolved_output
 
             # 2. Check DOM for JS-injected PDF links / iframes
             html = page.content()
@@ -988,7 +1097,7 @@ def fetch_via_browser(
                     if blob:
                         blobs.append(blob)
                 if blobs:
-                    return merge_pdf_bytes_list(blobs, output_path)
+                    return merge_pdf_bytes_list(blobs, resolved_output), resolved_output
 
             # 3. Paginate with ArrowRight / ArrowLeft and capture each page via PDF command
             turn_key = "ArrowLeft" if direction == "left" else "ArrowRight"
@@ -1138,8 +1247,8 @@ def fetch_via_browser(
                             continue
 
             if captured_pdfs and len(captured_pdfs) >= len(collected_page_pdfs):
-                return merge_pdf_bytes_list(captured_pdfs, output_path)
-            return merge_pdf_bytes_list(collected_page_pdfs, output_path)
+                return merge_pdf_bytes_list(captured_pdfs, resolved_output), resolved_output
+            return merge_pdf_bytes_list(collected_page_pdfs, resolved_output), resolved_output
         finally:
             if created_page:
                 try:
@@ -1160,6 +1269,7 @@ def fetch_and_merge(
     timeout: int = 30,
     allow_browser: bool = True,
     direction: str = "right",
+    auto_name: bool = False,
 ) -> int:
     """Fetch PDF(s) from url (with pagination) and write a single merged PDF to output_path."""
     if not is_http_url(url):
@@ -1190,7 +1300,15 @@ def fetch_and_merge(
     # Step 3: Browser fallback for JS viewers / embedded PDFs
     if allow_browser:
         log("[Fetch] No static PDF links found. Trying headless browser...")
-        return fetch_via_browser(url, output_path, max_pages=max_pages, timeout=timeout, direction=direction)
+        pages, _ = fetch_via_browser(
+            url,
+            output_path,
+            max_pages=max_pages,
+            timeout=timeout,
+            direction=direction,
+            auto_name=auto_name,
+        )
+        return pages
 
     raise RuntimeError(f"No PDF content found at URL: {url}")
 
@@ -1203,23 +1321,61 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout in seconds (default: 30)")
     parser.add_argument("--direction", choices=["right", "left"], default="right", help="Page-turn key direction (default: right)")
     parser.add_argument("--no-browser", action="store_true", help="Disable Playwright browser fallback")
+    parser.add_argument("--auto-name", action="store_true", help="Auto-name output as <Title>_<YYYYMMDD>.pdf when available")
     args = parser.parse_args()
 
     output_path = Path(args.output).expanduser().resolve()
+    final_path = output_path
     try:
-        total_pages = fetch_and_merge(
-            url=args.url.strip(),
-            output_path=output_path,
-            max_pages=max(1, args.max_pages),
-            timeout=max(5, args.timeout),
-            allow_browser=not args.no_browser,
-            direction=args.direction,
-        )
+        if args.auto_name and not args.no_browser:
+            # Allow fetch_and_merge / fetch_via_browser to resolve final output path
+            if not is_http_url(args.url.strip()):
+                raise ValueError(f"Invalid URL (must start with http:// or https://): {args.url.strip()}")
+            session = create_session()
+            log(f"[Fetch] Checking URL: {args.url.strip()}")
+            direct_blob = download_if_pdf(session, args.url.strip(), timeout=max(5, args.timeout))
+            if direct_blob is not None:
+                log("[Fetch] Direct PDF detected.")
+                total_pages = merge_pdf_bytes_list([direct_blob], output_path)
+            else:
+                pdf_urls = crawl_html_for_pdfs(session, args.url.strip(), max_pages=max(1, args.max_pages), timeout=max(5, args.timeout))
+                if pdf_urls:
+                    blobs = [b for u in pdf_urls if (b := download_if_pdf(session, u, timeout=max(5, args.timeout))) is not None]
+                    if not blobs:
+                        raise RuntimeError(f"No PDF content found at URL: {args.url.strip()}")
+                    total_pages = merge_pdf_bytes_list(blobs, output_path)
+                else:
+                    log("[Fetch] No static PDF links found. Trying headless browser...")
+                    total_pages, final_path = fetch_via_browser(
+                        url=args.url.strip(),
+                        output_path=output_path,
+                        max_pages=max(1, args.max_pages),
+                        timeout=max(5, args.timeout),
+                        direction=args.direction,
+                        auto_name=True,
+                    ) if False else fetch_via_browser(
+                        args.url.strip(),
+                        output_path,
+                        max_pages=max(1, args.max_pages),
+                        timeout=max(5, args.timeout),
+                        direction=args.direction,
+                        auto_name=True,
+                    )
+        else:
+            total_pages = fetch_and_merge(
+                url=args.url.strip(),
+                output_path=output_path,
+                max_pages=max(1, args.max_pages),
+                timeout=max(5, args.timeout),
+                allow_browser=not args.no_browser,
+                direction=args.direction,
+                auto_name=args.auto_name,
+            )
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr, flush=True)
         return 1
 
-    log(f"OUTPUT_PDF={output_path}")
+    log(f"OUTPUT_PDF={final_path}")
     log(f"PAGES={total_pages}")
     return 0
 

@@ -2606,30 +2606,11 @@ struct ContentView: View {
                             }
                         }
                     } label: {
-                        Text(model.uiLanguage.label)
-                            .padding(.horizontal, 10)
+                        Text("  \(model.uiLanguage.label)  ")
+                            .padding(.horizontal, 8)
                     }
                     .menuStyle(.borderlessButton)
                     .accessibilityLabel(model.t("言語", "Language"))
-                    Button {
-                        model.launchLoginBrowser()
-                    } label: {
-                        Label(model.t("ログイン用ブラウザ", "Login Browser"), systemImage: "safari")
-                    }
-                    .disabled(model.isRunning)
-
-                    Button {
-                        model.refreshDockerStatus()
-                        model.refreshRuntimeChecks()
-                    } label: {
-                        Label(model.t("再診断", "Refresh"), systemImage: "arrow.clockwise")
-                    }
-
-                    Button {
-                        model.openOutputDirectory()
-                    } label: {
-                        Label(model.t("出力フォルダ", "Output Folder"), systemImage: "folder")
-                    }
 
                     if model.isRunning {
                         Button(role: .destructive) {

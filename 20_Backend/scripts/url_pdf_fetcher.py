@@ -633,15 +633,23 @@ def _find_kindle_page_box(page) -> dict | None:
         return None
 
 
-def capture_kindle_page_as_pdf_bytes(page) -> tuple[bytes, bytes] | None:
-    """Capture the rendered Kindle page blob image via clipped screenshot -> (pdf_bytes, png_bytes)."""
+def capture_kindle_page_as_pdf_bytes(page, pad_ratio: float = 0.07) -> tuple[bytes, bytes] | None:
+    """Capture the rendered Kindle page blob image via clipped screenshot with comfortable book margins."""
     box = _find_kindle_page_box(page)
     if not box:
         return None
     png_bytes = page.screenshot(clip=box, timeout=15000)
     buf = io.BytesIO()
     with Image.open(io.BytesIO(png_bytes)) as img:
-        img.convert("RGB").save(buf, "PDF")
+        rgb = img.convert("RGB")
+        if pad_ratio > 0:
+            pad_x = max(24, int(round(rgb.width * pad_ratio)))
+            pad_y = max(32, int(round(rgb.height * pad_ratio)))
+            canvas = Image.new("RGB", (rgb.width + 2 * pad_x, rgb.height + 2 * pad_y), (255, 255, 255))
+            canvas.paste(rgb, (pad_x, pad_y))
+            canvas.save(buf, "PDF")
+        else:
+            rgb.save(buf, "PDF")
     return buf.getvalue(), png_bytes
 
 

@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import re
+import signal
 import sqlite3
 import sys
 import tempfile
@@ -857,6 +858,14 @@ def verify_exported_pdf(
         doc.close()
 
 
+class CaptureCanceled(BaseException):
+    """Let cleanup run on a Stop request without treating it as a retryable reader error."""
+
+
+def cancel_capture(_signum, _frame) -> None:
+    raise CaptureCanceled()
+
+
 class IncompleteKindleCapture(RuntimeError):
     def __init__(self, message: str, page_count: int, expected_pages: int | None):
         super().__init__(message)
@@ -920,6 +929,16 @@ class KindleCheckpoint:
                 (ordinal, capture.pdf, capture.position, capture.image_hash,
                  capture.total, capture.percent, capture.viewport_height),
             )
+
+    def progress(self) -> tuple[int, int | None]:
+        if not self.path.is_file():
+            return 0, None
+        try:
+            with closing(sqlite3.connect(self.path)) as db:
+                row = db.execute("SELECT ordinal, total FROM pages ORDER BY ordinal DESC LIMIT 1").fetchone()
+                return row if row is not None else (0, None)
+        except sqlite3.Error:
+            return 0, None
 
     def remove(self) -> None:
         self.path.unlink(missing_ok=True)
@@ -1964,8 +1983,8 @@ def main() -> int:
     result_details: dict[str, int] = {}
     output_path = Path(args.output).expanduser().resolve()
     final_path = output_path
+    checkpoint = KindleCheckpoint(args.kindle_checkpoint) if args.kindle_checkpoint else None
     try:
-        checkpoint = KindleCheckpoint(args.kindle_checkpoint) if args.kindle_checkpoint else None
         if checkpoint is not None and not args.no_browser:
             if not is_http_url(args.url.strip()):
                 raise ValueError("Invalid source URL")
@@ -2019,6 +2038,17 @@ def main() -> int:
                 direction=args.direction,
                 auto_name=args.auto_name,
             )
+    except CaptureCanceled:
+        if args.result_json and checkpoint is not None:
+            count, total = checkpoint.progress()
+            if count:
+                args.result_json.write_text(json.dumps({
+                    "pageCount": count,
+                    "expectedPages": total,
+                    "message": "取得を中断しました。",
+                }), encoding="utf-8")
+        log("[Fetch] Canceled.")
+        return 130
     except Exception as exc:
         if args.result_json and isinstance(exc, IncompleteKindleCapture):
             args.result_json.write_text(json.dumps({
@@ -2041,4 +2071,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, cancel_capture)
     sys.exit(main())

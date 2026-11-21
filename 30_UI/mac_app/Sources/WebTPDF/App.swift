@@ -361,7 +361,7 @@ final class AppModel: ObservableObject {
     private var player: AVPlayer?
     private var activeOutputDirectory: URL?
     private var activeDryRun = false
-    private var cancelRequested = false
+    @Published private var cancelRequested = false
     private var jobStartedAt: Date?
     private var timerTask: Task<Void, Never>?
     private var preflightTask: Task<Void, Never>?
@@ -464,7 +464,18 @@ final class AppModel: ObservableObject {
     }
 
     var isRunning: Bool {
-        process != nil || preflightTask != nil || fetchProcess != nil || isFetchingURL || isRunningQueue
+        isUpdatingApp || process != nil || preflightTask != nil || fetchProcess != nil || isFetchingURL || isRunningQueue
+    }
+
+    var activeOperationLabel: String? {
+        guard isRunning else { return nil }
+        if isUpdatingApp { return t("更新中", "Updating") }
+        if cancelRequested { return t("停止中", "Stopping") }
+        return t("実行中", "Running")
+    }
+
+    var canCancelJob: Bool {
+        isRunning && !isUpdatingApp && !cancelRequested
     }
 
     var canEnqueueURL: Bool {
@@ -745,6 +756,14 @@ final class AppModel: ObservableObject {
         saveURLFetchHistory()
     }
 
+    private func recordURLFetchFailure(url: String, direction: PageTurnDirection, error: Error) {
+        let result = (error as? URLFetchInterrupted)?.result
+        recordURLFetchHistory(
+            url: url, direction: direction, outputURL: nil, succeeded: false,
+            errorMessage: error.localizedDescription, pageCount: result?.pageCount, expectedPages: result?.expectedPages
+        )
+    }
+
     func backfillHistoryPDFPageCounts() {
         let missing = urlFetchHistory.compactMap { entry -> (UUID, String)? in
             guard entry.pageCount == nil, let path = entry.outputPath else { return nil }
@@ -908,6 +927,7 @@ final class AppModel: ObservableObject {
         preflightTask = Task { [weak self] in
             guard let self else { return }
             var processedCount = 0
+            var failedCount = 0
 
             while !self.cancelRequested,
                   !self.isQueueAutoPaused,
@@ -916,36 +936,34 @@ final class AppModel: ObservableObject {
                 let item = self.pdfQueue[nextIndex]
                 self.pdfQueue[nextIndex].status = .running
                 self.pdfQueue[nextIndex].errorMessage = nil
+                self.pdfQueue[nextIndex].outputURL = nil
                 self.statusMessage = self.t("キュー実行中 (\(processedCount)): \(item.url)", "Queue (\(processedCount)): \(item.url)")
                 self.appendLog("\n[Queue #\(processedCount)] (\(item.direction.label)) \(item.url)\n")
 
+                let outcome: Result<(URL, URLFetchResult), Error>
                 do {
-                    let (mergedURL, result) = try await self.performURLFetch(urlString: item.url, direction: item.direction)
-                    if self.cancelRequested {
-                        self.pdfQueue[nextIndex].status = .pending
-                        break
-                    }
-                    self.pdfQueue[nextIndex].status = .completed
-                    self.pdfQueue[nextIndex].outputURL = mergedURL
+                    outcome = .success(try await self.performURLFetch(urlString: item.url, direction: item.direction))
+                } catch {
+                    outcome = .failure(error)
+                }
+                // Earlier rows can be removed while awaiting the subprocess.
+                guard let index = self.pdfQueue.firstIndex(where: { $0.id == item.id }) else { continue }
+                switch outcome {
+                case let .success((mergedURL, result)):
+                    self.pdfQueue[index].status = .completed
+                    self.pdfQueue[index].outputURL = mergedURL
                     self.ebookURL = mergedURL
                     self.fetchedPDFURL = mergedURL
                     self.fetchedFromSourceURL = item.url
                     self.outputDirectory = mergedURL.deletingLastPathComponent()
                     self.recordURLFetchHistory(url: item.url, direction: item.direction, outputURL: mergedURL, succeeded: true, pageCount: result.pageCount, expectedPages: result.expectedPages)
                     self.appendLog("[Queue #\(processedCount)] Saved -> \(mergedURL.path)\n")
-                } catch {
-                    if self.cancelRequested {
-                        self.pdfQueue[nextIndex].status = .pending
-                        break
-                    }
-                    self.pdfQueue[nextIndex].status = .failed
-                    self.pdfQueue[nextIndex].errorMessage = error.localizedDescription
-                    let result = (error as? URLFetchInterrupted)?.result
-                    self.recordURLFetchHistory(
-                        url: item.url, direction: item.direction, outputURL: nil, succeeded: false,
-                        errorMessage: error.localizedDescription, pageCount: result?.pageCount, expectedPages: result?.expectedPages
-                    )
-                    self.appendLog("[Queue #\(processedCount)] Failed: \(error.localizedDescription)\n")
+                case let .failure(error):
+                    if !self.cancelRequested { failedCount += 1 }
+                    self.pdfQueue[index].status = self.cancelRequested ? .pending : .failed
+                    self.pdfQueue[index].errorMessage = self.cancelRequested ? nil : error.localizedDescription
+                    self.recordURLFetchFailure(url: item.url, direction: item.direction, error: error)
+                    self.appendLog("[Queue #\(processedCount)] \(error.localizedDescription)\n")
                 }
             }
 
@@ -960,6 +978,14 @@ final class AppModel: ObservableObject {
                 let remaining = self.pdfQueue.filter { $0.status == .pending }.count
                 self.statusMessage = self.t("自動実行を一時停止しました（残り\(remaining)件）", "Queue paused (\(remaining) pending)")
                 self.progressText = self.t("一時停止", "Paused")
+            } else if failedCount > 0 {
+                self.runState = .failed
+                self.statusMessage = self.t(
+                    "キュー終了（成功 \(processedCount - failedCount)件、失敗 \(failedCount)件）",
+                    "Queue finished (\(processedCount - failedCount) succeeded, \(failedCount) failed)"
+                )
+                self.progressText = "100%"
+                self.remainingText = "00:00"
             } else {
                 self.runState = .completed
                 self.statusMessage = self.t("キュー実行完了 (\(processedCount)件処理)", "Queue completed (\(processedCount) item(s))")
@@ -981,6 +1007,7 @@ final class AppModel: ObservableObject {
         }
         sourceURLText = ""
 
+        let direction = pageTurnDirection
         cancelRequested = false
         runState = .running
         isFetchingURL = true
@@ -991,7 +1018,7 @@ final class AppModel: ObservableObject {
         logText = "Fetching PDF from URL: \(urlString)\n"
         recordURLFetchHistory(
             url: urlString,
-            direction: pageTurnDirection,
+            direction: direction,
             outputURL: nil,
             succeeded: false,
             errorMessage: t("取得中...", "Fetching...")
@@ -1004,15 +1031,10 @@ final class AppModel: ObservableObject {
             }
 
             do {
-                let (mergedURL, result) = try await self.performURLFetch(urlString: urlString)
+                let (mergedURL, result) = try await self.performURLFetch(urlString: urlString, direction: direction)
                 self.preflightTask = nil
                 self.isFetchingURL = false
                 self.stopProgressClock()
-                if self.cancelRequested {
-                    self.runState = .idle
-                    self.statusMessage = "Canceled"
-                    return
-                }
                 self.ebookURL = mergedURL
                 self.fetchedPDFURL = mergedURL
                 self.fetchedFromSourceURL = urlString
@@ -1022,7 +1044,7 @@ final class AppModel: ObservableObject {
                 self.progressText = "100%"
                 self.remainingText = "00:00"
                 self.refreshLibraryPDFs()
-                self.recordURLFetchHistory(url: urlString, direction: pageTurnDirection, outputURL: mergedURL, succeeded: true, pageCount: result.pageCount, expectedPages: result.expectedPages)
+                self.recordURLFetchHistory(url: urlString, direction: direction, outputURL: mergedURL, succeeded: true, pageCount: result.pageCount, expectedPages: result.expectedPages)
                 self.appendLog("\nMerged PDF saved to: \(mergedURL.path)\n")
                 self.sendCompletionNotification(
                     title: self.t("PDF作成完了", "PDF Created"),
@@ -1032,21 +1054,10 @@ final class AppModel: ObservableObject {
             } catch {
                 self.preflightTask = nil
                 self.isFetchingURL = false
+                self.recordURLFetchFailure(url: urlString, direction: direction, error: error)
                 if self.cancelRequested {
-                    self.recordURLFetchHistory(
-                        url: urlString,
-                        direction: self.pageTurnDirection,
-                        outputURL: nil,
-                        succeeded: false,
-                        errorMessage: self.t("キャンセル", "Canceled")
-                    )
                     self.finishCanceledPreflight()
                 } else {
-                    let result = (error as? URLFetchInterrupted)?.result
-                    self.recordURLFetchHistory(
-                        url: urlString, direction: self.pageTurnDirection, outputURL: nil, succeeded: false,
-                        errorMessage: error.localizedDescription, pageCount: result?.pageCount, expectedPages: result?.expectedPages
-                    )
                     self.fail(error.localizedDescription)
                 }
                 self.startQueueIfAutoRunEnabled()
@@ -1673,6 +1684,7 @@ final class AppModel: ObservableObject {
             try proc.run()
             self.process = proc
         } catch {
+            isUpdatingApp = false
             fail("プロセスの起動に失敗しました: \(error.localizedDescription)")
         }
     }
@@ -1819,11 +1831,12 @@ final class AppModel: ObservableObject {
     }
 
     func cancelJob() {
+        guard canCancelJob else { return }
         cancelRequested = true
+        isQueueAutoPaused = true
+        statusMessage = t("停止中…", "Stopping…")
+        // Completion handlers keep ownership of the task until it has actually stopped.
         preflightTask?.cancel()
-        preflightTask = nil
-        isFetchingURL = false
-        isRunningQueue = false
         if let fetchProcess, fetchProcess.isRunning {
             fetchProcess.terminate()
         }
@@ -2163,11 +2176,9 @@ final class AppModel: ObservableObject {
                         try? JSONDecoder().decode(URLFetchResult.self, from: $0)
                     }
                     try? FileManager.default.removeItem(at: resultURL)
-                    if self?.cancelRequested == true {
-                        continuation.resume(throwing: UserVisibleError(message: "Canceled"))
-                    } else if terminated.terminationStatus == 0,
-                              let result, let path = result.outputPath,
-                              FileManager.default.fileExists(atPath: path) {
+                    if terminated.terminationStatus == 0,
+                       let result, let path = result.outputPath,
+                       FileManager.default.fileExists(atPath: path) {
                         continuation.resume(returning: (URL(fileURLWithPath: path), result))
                     } else if let result, let reason = result.message {
                         let canResume = checkpointURL.map {
@@ -2177,6 +2188,9 @@ final class AppModel: ObservableObject {
                             ? (self?.t(" 履歴の「再ダウンロード」で再開できます。", " Use Re-download in history to resume.") ?? "")
                             : ""
                         continuation.resume(throwing: URLFetchInterrupted(result: result, message: reason + retry))
+                    } else if self?.cancelRequested == true {
+                        let message = self?.t("キャンセル", "Canceled") ?? "Canceled"
+                        continuation.resume(throwing: UserVisibleError(message: message))
                     } else if let checkpointURL, FileManager.default.fileExists(atPath: checkpointURL.path) {
                         let message = self?.t(
                             "取得が中断されました。履歴の「再ダウンロード」で続きから再開します。",
@@ -2454,12 +2468,19 @@ final class AppModel: ObservableObject {
                 center.add(req, withCompletionHandler: nil)
             } else {
                 Task.detached {
-                    let safeTitle = title.replacingOccurrences(of: "\"", with: "\\\"")
-                    let safeBody = body.replacingOccurrences(of: "\"", with: "\\\"")
+                    let script = """
+                    on run args
+                        display notification (item 2 of args) with title ("WebTPDF Mac — " & item 1 of args) sound name "Glass"
+                    end run
+                    """
                     let proc = Process()
                     proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-                    proc.arguments = ["-e", "display notification \"\(safeBody)\" with title \"WebTPDF Mac — \(safeTitle)\" sound name \"Glass\""]
-                    try? proc.run()
+                    proc.arguments = ["-e", script, "--", title, body]
+                    do {
+                        try proc.run()
+                    } catch {
+                        return
+                    }
                     proc.waitUntilExit()
                 }
             }
@@ -2760,12 +2781,24 @@ struct ContentView: View {
                     .menuStyle(.borderlessButton)
                     .accessibilityLabel(model.t("言語", "Language"))
 
-                    if model.isRunning {
+                    if let operation = model.activeOperationLabel {
+                        HStack(spacing: 5) {
+                            ProgressView()
+                                .controlSize(.small)
+                                .accessibilityHidden(true)
+                            Text(operation)
+                                .font(.callout)
+                        }
+                        .fixedSize()
+                    }
+
+                    if model.canCancelJob {
                         Button(role: .destructive) {
                             model.cancelJob()
                         } label: {
                             Label(model.t("停止", "Stop"), systemImage: "stop.fill")
                         }
+                        .help(model.t("実行中の処理を停止", "Stop the current operation"))
                         .keyboardShortcut(".", modifiers: [.command])
                     }
                 }

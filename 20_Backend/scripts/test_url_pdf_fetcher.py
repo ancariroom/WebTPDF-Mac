@@ -314,6 +314,25 @@ class UrlPdfFetcherTests(unittest.TestCase):
                 pixels = page.get_pixmap()
                 self.assertAlmostEqual(pixels.pixel(pixels.width // 2, pixels.height // 2)[0], number * 8, delta=3)
 
+    def test_canceled_kindle_capture_reports_saved_progress(self) -> None:
+        output = self.root / "canceled.pdf"
+        checkpoint = fetcher.KindleCheckpoint(self.root / "checkpoint.sqlite3")
+        checkpoint.append(1, fetcher.KindleCapture(make_sample_pdf_bytes(1), 1, None, 4, None, None))
+        report = self.root / "result.json"
+        args = [
+            "url_pdf_fetcher", "--url", "https://read.amazon.co.jp/?asin=TEST",
+            "--output", str(output), "--kindle-checkpoint", str(checkpoint.path),
+            "--result-json", str(report),
+        ]
+        with patch.object(sys, "argv", args), patch.object(
+            fetcher, "fetch_via_browser", side_effect=fetcher.CaptureCanceled
+        ):
+            self.assertEqual(fetcher.main(), 130)
+        result = json.loads(report.read_text(encoding="utf-8"))
+        self.assertEqual((result["pageCount"], result["expectedPages"]), (1, 4))
+        self.assertEqual(checkpoint.progress(), (1, 4))
+        self.assertFalse(output.exists())
+
     def test_direct_pdf_download(self) -> None:
         out_pdf = self.root / "out_direct.pdf"
         pages = fetcher.fetch_and_merge(

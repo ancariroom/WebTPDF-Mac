@@ -3,6 +3,7 @@ import AVFoundation
 import PDFKit
 import SwiftUI
 import UniformTypeIdentifiers
+@preconcurrency import UserNotifications
 
 @main
 struct EbookConverterAudioLabApp: App {
@@ -15,6 +16,7 @@ struct EbookConverterAudioLabApp: App {
                 .frame(minWidth: 980, minHeight: 680)
                 .onAppear {
                     appDelegate.model = model
+                    model.requestNotificationPermission()
                     model.refreshDockerStatus()
                     model.refreshTTSModels()
                     model.refreshOllamaModels()
@@ -29,8 +31,20 @@ struct EbookConverterAudioLabApp: App {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     weak var model: AppModel?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        UNUserNotificationCenter.current().delegate = self
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
+    }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
@@ -506,6 +520,10 @@ final class AppModel: ObservableObject {
                 self.progressText = "100%"
                 self.remainingText = "00:00"
                 self.refreshLibraryPDFs()
+                self.sendCompletionNotification(
+                    title: self.t("PDF圧縮完了", "PDF Compression Complete"),
+                    body: target.lastPathComponent
+                )
                 self.startQueueIfAutoRunEnabled()
             } else {
                 self.fail(self.t("PDF圧縮に失敗しました", "PDF compression failed") + " (exit \(exitCode)).")
@@ -809,6 +827,10 @@ final class AppModel: ObservableObject {
                 self.statusMessage = self.t("キュー実行完了 (\(processedCount)件処理)", "Queue completed (\(processedCount) item(s))")
                 self.progressText = "100%"
                 self.remainingText = "00:00"
+                self.sendCompletionNotification(
+                    title: self.t("キュー実行完了", "Queue Complete"),
+                    body: self.t("\(processedCount)件の処理が完了しました。", "Processed \(processedCount) item(s).")
+                )
             }
         }
     }
@@ -857,6 +879,10 @@ final class AppModel: ObservableObject {
                 self.refreshLibraryPDFs()
                 self.recordURLFetchHistory(url: urlString, direction: pageTurnDirection, outputURL: mergedURL, succeeded: true)
                 self.appendLog("\nMerged PDF saved to: \(mergedURL.path)\n")
+                self.sendCompletionNotification(
+                    title: self.t("PDF作成完了", "PDF Created"),
+                    body: mergedURL.lastPathComponent
+                )
                 self.startQueueIfAutoRunEnabled()
             } catch {
                 self.preflightTask = nil
@@ -2128,6 +2154,10 @@ final class AppModel: ObservableObject {
             progressFraction = 1
             progressText = "100%"
             remainingText = "00:00"
+            sendCompletionNotification(
+                title: t("音声変換完了", "Audio Conversion Complete"),
+                body: artifact.lastPathComponent
+            )
             return
         }
 
@@ -2202,6 +2232,35 @@ final class AppModel: ObservableObject {
         }
         updateProgress(from: chunk)
         updateTimingLabels()
+    }
+
+    func requestNotificationPermission() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
+    }
+
+    func sendCompletionNotification(title: String, body: String) {
+        let center = UNUserNotificationCenter.current()
+        center.getNotificationSettings { settings in
+            let authorized = settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional
+            if authorized {
+                let content = UNMutableNotificationContent()
+                content.title = title
+                content.body = body
+                content.sound = .default
+                let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+                center.add(req, withCompletionHandler: nil)
+            } else {
+                Task.detached {
+                    let safeTitle = title.replacingOccurrences(of: "\"", with: "\\\"")
+                    let safeBody = body.replacingOccurrences(of: "\"", with: "\\\"")
+                    let proc = Process()
+                    proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+                    proc.arguments = ["-e", "display notification \"\(safeBody)\" with title \"WebTPDF Mac — \(safeTitle)\" sound name \"Glass\""]
+                    try? proc.run()
+                    proc.waitUntilExit()
+                }
+            }
+        }
     }
 
     private func fail(_ message: String) {

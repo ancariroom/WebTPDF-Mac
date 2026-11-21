@@ -35,7 +35,8 @@ swiftc \
   -framework SwiftUI \
   -framework AVFoundation \
   -framework PDFKit \
-  -framework AppKit
+  -framework AppKit \
+  -framework UserNotifications
 
 cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

@@ -592,6 +592,75 @@ def capture_fixed_layout_pf_pages(page, cdp_session=None) -> bytes | None:
             pass
 
 
+def is_kindle_cloud_reader(page) -> bool:
+    """Return True if the page is Amazon Kindle Cloud Reader."""
+    try:
+        if "read.amazon." in (page.url or "").lower():
+            return True
+        return page.locator("img[src^='blob:https://read.amazon.']").count() > 0
+    except Exception:
+        return False
+
+
+def dismiss_kindle_dialogs(page) -> None:
+    """Dismiss Kindle Cloud Reader modal prompts (e.g. 'Most Recent Page Read') if visible."""
+    try:
+        no_btn = page.locator("button:has-text('No')").first
+        if no_btn.count() > 0 and no_btn.is_visible():
+            no_btn.click(timeout=1500)
+            page.wait_for_timeout(400)
+    except Exception:
+        pass
+
+
+def _find_kindle_page_box(page) -> dict | None:
+    """Return the bounding box of the largest visible Kindle blob page image."""
+    try:
+        imgs = page.locator("img[src^='blob:']")
+        count = imgs.count()
+        best_box = None
+        best_area = 0.0
+        for i in range(count):
+            box = imgs.nth(i).bounding_box()
+            if not box:
+                continue
+            w, h = box.get("width", 0.0), box.get("height", 0.0)
+            if w > 100 and h > 100 and (w * h) > best_area:
+                best_area = w * h
+                best_box = box
+        return best_box
+    except Exception:
+        return None
+
+
+def capture_kindle_page_as_pdf_bytes(page) -> tuple[bytes, bytes] | None:
+    """Capture the rendered Kindle page blob image via clipped screenshot -> (pdf_bytes, png_bytes)."""
+    box = _find_kindle_page_box(page)
+    if not box:
+        return None
+    png_bytes = page.screenshot(clip=box, timeout=15000)
+    buf = io.BytesIO()
+    with Image.open(io.BytesIO(png_bytes)) as img:
+        img.convert("RGB").save(buf, "PDF")
+    return buf.getvalue(), png_bytes
+
+
+def measure_cover_aspect_ratio(png_bytes: bytes) -> float | None:
+    """Estimate portrait height/width ratio of non-white cover artwork in png_bytes."""
+    try:
+        with Image.open(io.BytesIO(png_bytes)) as im:
+            bbox = im.convert("RGB").point(lambda x: 0 if x > 245 else 255).getbbox()
+            if not bbox:
+                return None
+            cw = bbox[2] - bbox[0]
+            ch = bbox[3] - bbox[1]
+            if cw > 100 and ch > 100 and ch > cw:
+                return max(1.25, min(1.65, ch / cw))
+    except Exception:
+        pass
+    return None
+
+
 def capture_page_as_pdf_bytes(page, cdp_session=None) -> bytes:
     """Capture the current Playwright page as PDF bytes via printToPDF or screenshot fallback."""
     fixed_bytes = capture_fixed_layout_pf_pages(page, cdp_session=cdp_session)
@@ -759,7 +828,8 @@ def fetch_via_browser(
             log(f"[Browser] Connecting to logged-in Chrome via CDP ({active_cdp_url})...")
             browser = p.chromium.connect_over_cdp(active_cdp_url)
             context = browser.contexts[0] if browser.contexts else browser.new_context()
-            page = next((pg for pg in context.pages if pg.url == start_url), None)
+            is_kindle_url = "read.amazon." in start_url.lower()
+            page = None if is_kindle_url else next((pg for pg in context.pages if pg.url == start_url), None)
             created_page = False
             if page is None:
                 page = context.new_page()
@@ -793,6 +863,11 @@ def fetch_via_browser(
                     pass
 
             page.on("response", handle_response)
+            if created_page and "read.amazon." in start_url.lower():
+                try:
+                    page.set_viewport_size({"width": 800, "height": 1140})
+                except Exception:
+                    pass
             response_status: int | None = None
             if created_page or page.url != start_url:
                 log(f"[Browser] Opening {start_url} ...")
@@ -808,6 +883,15 @@ def fetch_via_browser(
             log("[Browser] Waiting for page render...")
             wait_for_page_ready(page, timeout_ms=12000)
             check_access_denied(page, response_status)
+            kindle_mode = is_kindle_cloud_reader(page)
+            if kindle_mode:
+                dismiss_kindle_dialogs(page)
+                if created_page:
+                    try:
+                        page.set_viewport_size({"width": 800, "height": 1140})
+                        page.wait_for_timeout(800)
+                    except Exception:
+                        pass
 
             # 1. If a PDF was fetched via XHR/embed during load, merge and return
             if captured_pdfs:
@@ -858,7 +942,10 @@ def fetch_via_browser(
             prev_pdf_hash: str | None = None
 
             for page_idx in range(1, max_pages + 1):
-                wait_for_page_ready(page, timeout_ms=12000)
+                if kindle_mode:
+                    dismiss_kindle_dialogs(page)
+                else:
+                    wait_for_page_ready(page, timeout_ms=12000)
                 png_bytes = page.screenshot(full_page=False, timeout=15000)
                 current_hash = hashlib.sha256(png_bytes).hexdigest()
 
@@ -868,7 +955,26 @@ def fetch_via_browser(
 
                 prev_hash = current_hash
                 pdf_count_before = len(captured_pdfs)
-                page_pdf_bytes = capture_page_as_pdf_bytes(page, cdp_session=cdp_session)
+                if kindle_mode:
+                    k_res = capture_kindle_page_as_pdf_bytes(page)
+                    if k_res is not None:
+                        page_pdf_bytes, k_png = k_res
+                        if page_idx == 1 and created_page:
+                            cover_ratio = measure_cover_aspect_ratio(k_png)
+                            if cover_ratio is not None:
+                                target_h = max(900, min(1400, int(640 * cover_ratio + 150)))
+                                try:
+                                    page.set_viewport_size({"width": 800, "height": target_h})
+                                    page.wait_for_timeout(800)
+                                    k_res2 = capture_kindle_page_as_pdf_bytes(page)
+                                    if k_res2 is not None:
+                                        page_pdf_bytes, _ = k_res2
+                                except Exception:
+                                    pass
+                    else:
+                        page_pdf_bytes = capture_page_as_pdf_bytes(page, cdp_session=cdp_session)
+                else:
+                    page_pdf_bytes = capture_page_as_pdf_bytes(page, cdp_session=cdp_session)
                 if is_pdf_visually_blank(page_pdf_bytes):
                     for retry in range(2):
                         log(f"[Browser] Page {page_idx} rendered blank; waiting and retrying ({retry + 1}/2)...")
@@ -894,10 +1000,26 @@ def fetch_via_browser(
                 log(f"[Browser] Captured page {page_idx} via PDF command ({len(page_pdf_bytes)} bytes)")
 
                 url_before_turn = page.url
+                prev_kindle_src = (
+                    page.evaluate("() => document.querySelector('img[src^=\"blob:\"]')?.src || ''")
+                    if kindle_mode
+                    else ""
+                )
                 # Press ArrowRight or ArrowLeft to advance to the next page
                 page.keyboard.press(turn_key)
-                page.wait_for_timeout(500)
-                wait_for_page_ready(page, timeout_ms=8000)
+                if kindle_mode:
+                    page.wait_for_timeout(450)
+                    try:
+                        page.wait_for_function(
+                            "(prev) => { const img = document.querySelector('img[src^=\"blob:\"]'); return img && img.complete && img.src !== prev; }",
+                            arg=prev_kindle_src,
+                            timeout=3000,
+                        )
+                    except Exception:
+                        pass
+                else:
+                    page.wait_for_timeout(500)
+                    wait_for_page_ready(page, timeout_ms=8000)
 
                 # If a PDF response was triggered by the page turn, prefer collected PDFs if complete
                 if len(captured_pdfs) > pdf_count_before:

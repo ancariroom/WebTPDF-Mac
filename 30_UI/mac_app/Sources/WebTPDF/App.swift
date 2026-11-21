@@ -1254,6 +1254,10 @@ final class AppModel: ObservableObject {
         AFTER_CNT=$(git rev-list --count HEAD)
         AFTER_SHA=$(git rev-parse --short HEAD)
         echo "Version: ${RUNNING_DISPLAY} -> v0.1.${AFTER_CNT} (${AFTER_SHA})"
+        if [ -n "$RUNNING_SHA" ] && [ "$RUNNING_SHA" = "$AFTER_SHA" ]; then
+          echo "NO_UPDATE_NEEDED=1"
+          exit 0
+        fi
         if [ -n "$RUNNING_SHA" ] && [ "$RUNNING_SHA" != "$AFTER_SHA" ]; then
           echo "Changes:"
           git log --oneline "${RUNNING_SHA}..${AFTER_SHA}" || true
@@ -1270,6 +1274,11 @@ final class AppModel: ObservableObject {
             self.stopProgressClock()
             self.isUpdatingApp = false
             if exitCode == 0 {
+                if self.logText.contains("NO_UPDATE_NEEDED=1") {
+                    self.runState = .completed
+                    self.statusMessage = self.t("すでに最新版です (\(currentDisplay))", "Already up to date (\(currentDisplay))")
+                    return
+                }
                 UserDefaults.standard.set(currentDisplay, forKey: "lastUpdatedFromVersion")
                 self.runState = .completed
                 self.statusMessage = self.t("アップデート完了・再起動中...", "Update complete. Relaunching...")

@@ -2925,8 +2925,14 @@ struct ContentView: View {
                 } else {
                     ForEach(Array(pageEntries.enumerated()), id: \.element.id) { idx, entry in
                         HStack(spacing: 10) {
-                            Image(systemName: entry.succeeded ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                                .foregroundStyle(entry.succeeded ? Color.green : Color.orange)
+                            let isFetchingEntry = !entry.succeeded && (entry.errorMessage == "取得中..." || entry.errorMessage == "Fetching...")
+                            if isFetchingEntry {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Image(systemName: entry.succeeded ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                                    .foregroundStyle(entry.succeeded ? Color.green : Color.orange)
+                            }
 
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(entry.url)

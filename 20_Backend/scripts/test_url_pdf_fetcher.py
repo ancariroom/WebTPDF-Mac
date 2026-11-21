@@ -12,6 +12,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from pypdf import PdfReader, PdfWriter
 
@@ -189,6 +190,90 @@ class UrlPdfFetcherTests(unittest.TestCase):
         self.httpd.shutdown()
         self.httpd.server_close()
         self.tmp.cleanup()
+
+    def test_kindle_redownload_merges_saved_pages_without_gaps(self) -> None:
+        import fitz
+
+        reader = self.root / "kindle.html"
+        html = """
+            <img id="page" width="200" height="260"><p id="position"></p>
+            <button id="back" hidden>Back to Library</button>
+            <button data-asin="TEST" hidden>Open book</button>
+            <script>
+              let current = 1;
+              let objectURL;
+              let failedOnce = false;
+              const image = document.querySelector('#page');
+              const position = document.querySelector('#position');
+              const back = document.querySelector('#back');
+              const book = document.querySelector('[data-asin]');
+              function render() {
+                const canvas = document.createElement('canvas');
+                canvas.width = 200;
+                canvas.height = 260;
+                const ctx = canvas.getContext('2d');
+                ctx.fillStyle = 'rgb(' + current * 8 + ',60,120)';
+                ctx.fillRect(0, 0, 200, 260);
+                canvas.toBlob((blob) => {
+                  if (objectURL) URL.revokeObjectURL(objectURL);
+                  objectURL = URL.createObjectURL(blob);
+                  image.src = objectURL;
+                  image.hidden = false;
+                  position.textContent = 'Page ' + current + ' of 28';
+                });
+              }
+              back.onclick = () => {
+                back.hidden = true;
+                position.textContent = '';
+                book.hidden = false;
+              };
+              book.onclick = () => {
+                book.hidden = true;
+                current = 23;
+                render();
+              };
+              document.addEventListener('keydown', (event) => {
+                if (!back.hidden || !book.hidden) return;
+                const next = current + (event.key === 'ArrowRight' ? 1 : -1);
+                if (next < 1 || next > 28) return;
+                if (FAIL_CONDITION) {
+                  failedOnce = true;
+                  image.hidden = false; // The old page is still behind the dialog.
+                  position.textContent = 'Oops... Something Went Wrong';
+                  back.hidden = false;
+                  return;
+                }
+                current = next;
+                render();
+              });
+              render();
+            </script>
+        """
+        reader.write_text(html.replace("FAIL_CONDITION", "next === 25"), encoding="utf-8")
+        url = f"http://127.0.0.1:{self.port}/kindle.html?asin=TEST"
+        output = self.root / "resumed.pdf"
+        checkpoint = fetcher.KindleCheckpoint(self.root / "checkpoint.sqlite3")
+        with patch.object(fetcher, "resolve_cdp_url", return_value=None), patch.object(
+            fetcher, "is_kindle_cloud_reader", return_value=True
+        ):
+            with self.assertRaisesRegex(RuntimeError, "取得済み: 24"):
+                fetcher.fetch_via_browser(url, output, 28, 10, kindle_checkpoint=checkpoint)
+            self.assertEqual(len(checkpoint.load()), 24)
+            self.assertFalse(output.exists())
+
+            # Simulate pressing Re-download. A second transient error exercises
+            # automatic recovery after the saved pages have been reloaded.
+            reader.write_text(
+                html.replace("FAIL_CONDITION", "next === 26 && !failedOnce"), encoding="utf-8"
+            )
+            count, result = fetcher.fetch_via_browser(url, output, 28, 10, kindle_checkpoint=checkpoint)
+
+        self.assertEqual((count, result), (28, output))
+        self.assertFalse(checkpoint.path.exists())
+        with fitz.open(output) as pdf:
+            for number, page in enumerate(pdf, 1):
+                pixels = page.get_pixmap()
+                self.assertAlmostEqual(pixels.pixel(pixels.width // 2, pixels.height // 2)[0], number * 8, delta=3)
 
     def test_direct_pdf_download(self) -> None:
         out_pdf = self.root / "out_direct.pdf"

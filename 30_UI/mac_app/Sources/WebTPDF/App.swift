@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import CryptoKit
 import PDFKit
 import SwiftUI
 import UniformTypeIdentifiers
@@ -718,6 +719,12 @@ final class AppModel: ObservableObject {
     }
 
     func redownloadFromHistory(_ item: URLFetchHistoryItem) {
+        guard !pdfQueue.contains(where: {
+            $0.url == item.url && $0.direction == item.direction
+                && ($0.status == .pending || $0.status == .running)
+        }) else {
+            return
+        }
         pdfQueue.append(PDFQueueItem(url: item.url, direction: item.direction))
         isQueueAutoPaused = false
         if !isRunning {
@@ -1983,12 +1990,23 @@ final class AppModel: ObservableObject {
         )
         let outputURL = fetchedPDFRoot.appendingPathComponent("\(makeJobID())_\(hostPart).pdf")
 
+        let resolvedDirection = direction ?? pageTurnDirection
+        let checkpointURL: URL?
+        if let host = parsed.host?.lowercased(), host.hasPrefix("read.amazon.") {
+            let source = "\(resolvedDirection.rawValue)\n\(urlString)"
+            let key = SHA256.hash(data: Data(source.utf8)).map { String(format: "%02x", $0) }.joined()
+            checkpointURL = applicationSupportRoot
+                .appendingPathComponent("KindleCheckpoints", isDirectory: true)
+                .appendingPathComponent("\(key).sqlite3")
+        } else {
+            checkpointURL = nil
+        }
+
         return try await withCheckedThrowingContinuation { continuation in
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: pythonCommand)
-            let resolvedDirection = direction ?? pageTurnDirection
             let maxPages = Int(maxPagesSetting.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 1000
-            proc.arguments = [
+            var arguments = [
                 scriptURL.path,
                 "--url", urlString,
                 "--output", outputURL.path,
@@ -1996,6 +2014,10 @@ final class AppModel: ObservableObject {
                 "--max-pages", String(max(1, maxPages)),
                 "--auto-name",
             ]
+            if let checkpointURL {
+                arguments += ["--kindle-checkpoint", checkpointURL.path]
+            }
+            proc.arguments = arguments
             proc.currentDirectoryURL = fetchedPDFRoot
 
             var environment = ProcessInfo.processInfo.environment
@@ -2059,6 +2081,12 @@ final class AppModel: ObservableObject {
                         continuation.resume(returning: finalURL)
                     } else if self?.cancelRequested == true {
                         continuation.resume(throwing: UserVisibleError(message: "Canceled"))
+                    } else if let checkpointURL, FileManager.default.fileExists(atPath: checkpointURL.path) {
+                        let message = self?.t(
+                            "取得が中断されました。履歴の「再ダウンロード」で続きから再開します。",
+                            "Capture interrupted. Use Re-download in history to resume."
+                        ) ?? "Capture interrupted. Use Re-download in history to resume."
+                        continuation.resume(throwing: UserVisibleError(message: message))
                     } else {
                         continuation.resume(throwing: UserVisibleError(message: "URLからのPDF取得に失敗しました (exit \(terminated.terminationStatus))。ログを確認してください。"))
                     }

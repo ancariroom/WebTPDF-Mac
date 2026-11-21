@@ -7,12 +7,15 @@ import argparse
 import hashlib
 import io
 import re
+import sqlite3
 import sys
 import tempfile
 import time
+from contextlib import closing
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -818,17 +821,88 @@ def verify_exported_pdf(
         doc.close()
 
 
-def _wait_for_kindle_reader(page, timeout_ms: int = 15000) -> bool:
+@dataclass(frozen=True)
+class KindleCapture:
+    pdf: bytes
+    position: int | None
+    image_hash: str | None
+    total: int | None
+    percent: int | None
+    viewport_height: int | None
+
+
+class KindleCheckpoint:
+    """Save each captured page and its reader position in the same transaction."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def load(self) -> list[KindleCapture]:
+        if not self.path.is_file():
+            return []
+        with closing(sqlite3.connect(self.path)) as db:
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pages'").fetchone() is None:
+                return []
+            rows = db.execute(
+                "SELECT pdf, position, image_hash, total, percent, viewport_height "
+                "FROM pages ORDER BY ordinal"
+            )
+            return [KindleCapture(*row) for row in rows]
+
+    def append(self, ordinal: int, capture: KindleCapture) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS pages (ordinal INTEGER PRIMARY KEY, pdf BLOB NOT NULL, "
+                "position INTEGER, image_hash TEXT, total INTEGER, percent INTEGER, viewport_height INTEGER)"
+            )
+            db.execute(
+                "INSERT INTO pages VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (ordinal, capture.pdf, capture.position, capture.image_hash,
+                 capture.total, capture.percent, capture.viewport_height),
+            )
+
+    def remove(self) -> None:
+        self.path.unlink(missing_ok=True)
+
+
+def _wait_for_kindle_reader(page, timeout_ms: int = 15000, previous_source: str = "") -> bool:
     """Wait until Kindle reader renders a blob page image or shows an Oops dialog."""
-    deadline = time.time() + (timeout_ms / 1000.0)
-    while time.time() < deadline:
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
         dismiss_kindle_dialogs(page)
         if is_kindle_oops(page):
             return False
-        if _find_kindle_page_box(page) is not None:
+        source = page.evaluate(KINDLE_PAGE_SOURCE)
+        if source and source != previous_source:
             return True
-        page.wait_for_timeout(500)
-    return _find_kindle_page_box(page) is not None and not is_kindle_oops(page)
+        page.wait_for_timeout(250)
+    return False
+
+
+KINDLE_PAGE_SOURCE = """() => {
+    const images = [...document.querySelectorAll('img[src^="blob:"]')];
+    const pages = images.map(img => ({img, box: img.getBoundingClientRect()}))
+        .filter(({img, box}) => img.complete && img.naturalWidth
+            && box.width > 100 && box.height > 100 && box.right > 0 && box.bottom > 0
+            && box.left < innerWidth && box.top < innerHeight);
+    pages.sort((a, b) => b.box.width * b.box.height - a.box.width * a.box.height);
+    return pages[0]?.img.src || '';
+}"""
+
+
+def wait_for_kindle_turn(page, previous_source: str, timeout_ms: int = 5000) -> bool:
+    """Wait for a decoded page image, or return as soon as the error dialog appears."""
+    deadline = time.monotonic() + timeout_ms / 1000
+    while True:
+        if is_kindle_oops(page):
+            return False
+        source = page.evaluate(KINDLE_PAGE_SOURCE)
+        if source and source != previous_source:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        page.wait_for_timeout(250)
 
 
 def recover_kindle_oops(
@@ -837,82 +911,79 @@ def recover_kindle_oops(
     last_kindle_page: int | None,
     turn_key: str,
     captured_count: int = 0,
+    last_image_hash: str | None = None,
 ) -> bool:
-    """Click 'Back to Library', reopen the book from library/URL, and resume at the next page."""
-    log("[Kindle] Detected 'Oops... Something Went Wrong'. Recovering via Back to Library...")
+    """Reopen the book through its reader and resume after the last verified capture."""
+    log("[Kindle] Reopening the book to recover the reader...")
     try:
-        back_btn = page.locator("button:has-text('Back to Library'), a:has-text('Back to Library')").first
-        if back_btn.count() > 0 and back_btn.is_visible():
-            back_btn.click(timeout=3000)
-            page.wait_for_timeout(3500)
-    except Exception:
-        pass
-
-    asin_match = re.search(r"[?&]asin=([A-Za-z0-9]+)", start_url)
-    asin = asin_match.group(1) if asin_match else None
-
-    try:
-        opened_from_library = False
-        if asin and "read.amazon" in (page.url or ""):
+        previous_source = page.evaluate(KINDLE_PAGE_SOURCE)
+        back_btn = page.get_by_role("button", name="Back to Library").or_(
+            page.get_by_role("link", name="Back to Library")
+        ).first
+        if back_btn.is_visible():
             try:
-                card = page.locator(
-                    f"[data-asin='{asin}'], [id*='{asin}'], a[href*='{asin}']"
-                ).first
-                if card.count() > 0 and card.is_visible():
-                    card.click(timeout=5000)
-                    page.wait_for_timeout(3000)
-                    opened_from_library = True
+                back_btn.click(timeout=3000)
+            except Exception:
+                pass
+
+        asin = parse_qs(urlparse(start_url).query).get("asin", [""])[0]
+        opened_from_library = False
+        if re.fullmatch(r"[A-Za-z0-9]+", asin):
+            card = page.locator(
+                f"[data-asin='{asin}'], [id*='{asin}'], a[href*='{asin}']"
+            ).first
+            try:
+                card.wait_for(state="visible", timeout=4000)
+                card.click(timeout=3000)
+                opened_from_library = _wait_for_kindle_reader(page, previous_source=previous_source)
             except Exception:
                 pass
 
         if not opened_from_library:
-            reopen_url = start_url
-            if asin:
-                parsed = urlparse(start_url)
-                reopen_url = f"{parsed.scheme}://{parsed.netloc}/?asin={asin}"
-            page.goto(reopen_url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(2500)
+            page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
+            if not _wait_for_kindle_reader(page):
+                return False
 
-        wait_for_page_ready(page, timeout_ms=12000)
-        if not _wait_for_kindle_reader(page, timeout_ms=15000):
-            return False
+        if captured_count == 0:
+            if is_kindle_not_at_start(page):
+                rewind_kindle_to_start(page, turn_key)
+            return _wait_for_kindle_reader(page)
 
-        if last_kindle_page is not None:
-            cur = get_kindle_page_number(page)
-            steps = 0
-            max_steps = max(captured_count + 20, 40)
-            while cur is not None and cur <= last_kindle_page and steps < max_steps:
-                steps += 1
-                prev_src = page.evaluate("() => document.querySelector('img[src^=\"blob:\"]')?.src || ''")
+        # When the footer is unavailable, start the search from the beginning.
+        # A reopened book can restore a later position than the last capture.
+        if last_kindle_page is None or get_kindle_page_number(page) is None:
+            rewind_kindle_to_start(page, turn_key)
+        reverse_key = "ArrowRight" if turn_key == "ArrowLeft" else "ArrowLeft"
+        for _ in range(max(captured_count + 20, 40)):
+            if is_kindle_oops(page):
+                return False
+            position = get_kindle_page_number(page)
+            source = page.evaluate(KINDLE_PAGE_SOURCE)
+            if not source:
+                return False
+            if last_image_hash is not None:
+                box = _find_kindle_page_box(page)
+                matches_image = box is not None and hashlib.sha256(
+                    page.screenshot(clip=box, timeout=5000)
+                ).hexdigest() == last_image_hash
+            else:
+                # Reflowable layouts can lack a clipped page image.
+                matches_image = last_kindle_page is not None and position == last_kindle_page
+            matches_position = last_kindle_page is None or position is None or position == last_kindle_page
+            if matches_image and matches_position:
                 page.keyboard.press(turn_key)
-                page.wait_for_timeout(350)
-                try:
-                    page.wait_for_function(
-                        "(prev) => { const img = document.querySelector('img[src^=\"blob:\"]'); return img && img.complete && img.src !== prev; }",
-                        arg=prev_src,
-                        timeout=2500,
-                    )
-                except Exception:
-                    pass
-                cur = get_kindle_page_number(page)
-            log(f"[Kindle] Resumed at page/location {cur} (after {last_kindle_page}).")
-        elif captured_count > 0:
-            for _ in range(captured_count):
-                prev_src = page.evaluate("() => document.querySelector('img[src^=\"blob:\"]')?.src || ''")
-                page.keyboard.press(turn_key)
-                page.wait_for_timeout(350)
-                try:
-                    page.wait_for_function(
-                        "(prev) => { const img = document.querySelector('img[src^=\"blob:\"]'); return img && img.complete && img.src !== prev; }",
-                        arg=prev_src,
-                        timeout=2500,
-                    )
-                except Exception:
-                    pass
-            log(f"[Kindle] Stepped {captured_count} page(s) to resume position.")
-
-        return _find_kindle_page_box(page) is not None and not is_kindle_oops(page)
-    except Exception:
+                if wait_for_kindle_turn(page, source):
+                    log(f"[Kindle] Resumed after captured page {captured_count}.")
+                    return True
+                return False
+            backwards = last_kindle_page is not None and position is not None and position > last_kindle_page
+            page.keyboard.press(reverse_key if backwards else turn_key)
+            if not wait_for_kindle_turn(page, source):
+                return False
+        log("[Kindle] Could not verify the last captured page after reopening.")
+        return False
+    except Exception as exc:
+        log(f"[Kindle] Reader recovery failed ({type(exc).__name__}).")
         return False
 
 
@@ -924,7 +995,10 @@ def _find_kindle_page_box(page) -> dict | None:
         best_box = None
         best_area = 0.0
         for i in range(count):
-            box = imgs.nth(i).bounding_box()
+            image = imgs.nth(i)
+            if not image.evaluate("(img) => img.complete && img.naturalWidth > 0"):
+                continue
+            box = image.bounding_box(timeout=1000)
             if not box:
                 continue
             w, h = box.get("width", 0.0), box.get("height", 0.0)
@@ -1232,6 +1306,7 @@ def fetch_via_browser(
     timeout: int,
     direction: str = "right",
     auto_name: bool = False,
+    kindle_checkpoint: KindleCheckpoint | None = None,
 ) -> tuple[int, Path]:
     """Use CDP (logged-in Chrome) or headless Chromium to paginate with ArrowRight/ArrowLeft and capture PDFs."""
     from playwright.sync_api import sync_playwright
@@ -1308,7 +1383,12 @@ def fetch_via_browser(
                 if resolved_output != output_path:
                     log(f"[AutoName] Output filename -> {resolved_output.name}")
             kindle_mode = is_kindle_cloud_reader(page)
-            if kindle_mode:
+            saved_pages = kindle_checkpoint.load() if kindle_mode and kindle_checkpoint else []
+            if saved_pages:
+                log(f"[Kindle] Loaded {len(saved_pages)} saved page(s); resuming capture.")
+                if saved_pages[-1].viewport_height is not None:
+                    page.set_viewport_size({"width": 800, "height": saved_pages[-1].viewport_height})
+            elif kindle_mode:
                 dismiss_kindle_dialogs(page)
                 if created_page:
                     try:
@@ -1318,13 +1398,13 @@ def fetch_via_browser(
                         pass
 
             # 1. If a PDF was fetched via XHR/embed during load, merge and return
-            if captured_pdfs:
+            if captured_pdfs and not saved_pages:
                 return merge_pdf_bytes_list(captured_pdfs, resolved_output), resolved_output
 
             # 2. Check DOM for JS-injected PDF links / iframes
             html = page.content()
             dom_pdf_links = extract_pdf_links_from_html(html, page.url)
-            if dom_pdf_links:
+            if dom_pdf_links and not saved_pages:
                 session = create_session()
                 blobs: list[bytes] = []
                 for link in dom_pdf_links:
@@ -1363,47 +1443,53 @@ def fetch_via_browser(
                     "[rel='next']",
                 ]
 
-            collected_page_pdfs: list[bytes] = []
+            collected_page_pdfs = [capture.pdf for capture in saved_pages]
             prev_hash: str | None = None
             prev_pdf_hash: str | None = None
             last_kindle_page: int | None = None
             expected_total_pages: int | None = None
             last_kindle_percent: int | None = None
+            last_kindle_image_hash: str | None = None
+            recovery_attempts = 0
+            needs_recovery = bool(saved_pages)
+            if saved_pages:
+                last_capture = saved_pages[-1]
+                prev_pdf_hash = pdf_content_signature(last_capture.pdf)
+                last_kindle_page = last_capture.position
+                last_kindle_image_hash = last_capture.image_hash
+                expected_total_pages = last_capture.total
+                last_kindle_percent = last_capture.percent
+            if len(saved_pages) > max_pages:
+                raise ValueError(f"最大ページ数を取得済みの {len(saved_pages)} ページ以上に設定してください。")
 
-            for page_idx in range(1, max_pages + 1):
+            while len(collected_page_pdfs) < max_pages:
+                page_idx = len(collected_page_pdfs) + 1
+                kindle_png = None
                 if kindle_mode:
-                    if page_idx == 1:
+                    dismiss_kindle_dialogs(page)
+                    if needs_recovery or is_kindle_oops(page):
+                        if recovery_attempts >= 3:
+                            raise RuntimeError(
+                                f"Kindleのエラーから復旧できませんでした（取得済み: {page_idx - 1} ページ）。"
+                            )
+                        recovery_attempts += 1
+                        log(f"[Kindle] Recovering before capture {page_idx} ({recovery_attempts}/3)...")
+                        needs_recovery = not recover_kindle_oops(
+                            page, start_url, last_kindle_page, turn_key,
+                            captured_count=page_idx - 1,
+                            last_image_hash=last_kindle_image_hash,
+                        )
+                        if needs_recovery:
+                            page.wait_for_timeout(1000)
+                        continue
+                    if page_idx == 1 and recovery_attempts == 0:
                         _wait_for_kindle_reader(page, timeout_ms=15000)
-                        saw_recent = False
-                        for _ in range(5):
-                            if dismiss_kindle_dialogs(page):
-                                saw_recent = True
-                            if saw_recent or is_kindle_not_at_start(page):
-                                break
-                            page.wait_for_timeout(500)
-                        if saw_recent or is_kindle_not_at_start(page):
+                        if is_kindle_oops(page):
+                            continue
+                        if is_kindle_not_at_start(page):
                             rewind_kindle_to_start(page, turn_key)
-                    else:
-                        dismiss_kindle_dialogs(page)
-                    if is_kindle_oops(page):
-                        recovered = False
-                        for attempt in range(3):
-                            log(f"[Kindle] Attempting recovery ({attempt + 1}/3)...")
-                            if recover_kindle_oops(
-                                page,
-                                start_url,
-                                last_kindle_page,
-                                turn_key,
-                                captured_count=len(collected_page_pdfs),
-                            ):
-                                recovered = True
-                                break
-                            page.wait_for_timeout(3000)
-                        if not recovered:
-                            if page_idx == 1:
-                                raise RuntimeError("Kindle でエラー画面 ('Oops... Something Went Wrong') が解消できませんでした。")
-                            log("[Kindle] Could not recover from error screen; stopping pagination.")
-                            break
+                        if is_kindle_oops(page):
+                            continue
                 else:
                     wait_for_page_ready(page, timeout_ms=12000)
                 png_bytes = page.screenshot(full_page=False, timeout=15000)
@@ -1419,8 +1505,14 @@ def fetch_via_browser(
                             dismiss_kindle_dialogs(page)
                             if is_kindle_oops(page):
                                 break
+                            source = page.evaluate(KINDLE_PAGE_SOURCE)
                             page.keyboard.press(turn_key)
-                            page.wait_for_timeout(1500)
+                            if source:
+                                wait_for_kindle_turn(page, source)
+                            else:
+                                page.wait_for_timeout(1500)
+                            if is_kindle_oops(page):
+                                break
                             png_retry = page.screenshot(full_page=False, timeout=15000)
                             retry_hash = hashlib.sha256(png_retry).hexdigest()
                             if retry_hash == prev_hash:
@@ -1433,6 +1525,8 @@ def fetch_via_browser(
                                             break
                                     except Exception:
                                         continue
+                                if is_kindle_oops(page):
+                                    break
                                 png_retry = page.screenshot(full_page=False, timeout=15000)
                                 retry_hash = hashlib.sha256(png_retry).hexdigest()
                             if retry_hash != prev_hash:
@@ -1440,22 +1534,29 @@ def fetch_via_browser(
                                 current_hash = retry_hash
                                 advanced = True
                                 break
-                        if not advanced and is_kindle_oops(page):
+                        if is_kindle_oops(page):
+                            continue
+                        if not advanced and (recovery_attempts or (
+                            expected_total_pages is not None and last_kindle_page is not None
+                            and last_kindle_page < expected_total_pages
+                        )):
+                            needs_recovery = True
                             continue
                     if prev_hash == current_hash:
                         log(f"[Browser] Page {page_idx} identical to previous; stopping pagination.")
                         break
 
-                prev_hash = current_hash
                 pdf_count_before = len(captured_pdfs)
                 if kindle_mode:
                     if _find_kindle_page_box(page) is None:
                         _wait_for_kindle_reader(page, timeout_ms=8000)
+                    if is_kindle_oops(page):
+                        continue
                     k_res = capture_kindle_page_as_pdf_bytes(page)
                     if k_res is not None:
-                        page_pdf_bytes, k_png = k_res
+                        page_pdf_bytes, kindle_png = k_res
                         if page_idx == 1 and created_page:
-                            cover_ratio = measure_cover_aspect_ratio(k_png)
+                            cover_ratio = measure_cover_aspect_ratio(kindle_png)
                             if cover_ratio is not None:
                                 target_h = max(900, min(1400, int(640 * cover_ratio + 150)))
                                 try:
@@ -1463,22 +1564,41 @@ def fetch_via_browser(
                                     page.wait_for_timeout(800)
                                     k_res2 = capture_kindle_page_as_pdf_bytes(page)
                                     if k_res2 is not None:
-                                        page_pdf_bytes, _ = k_res2
+                                        page_pdf_bytes, kindle_png = k_res2
                                 except Exception:
                                     pass
+                    elif last_kindle_image_hash is not None:
+                        needs_recovery = True
+                        continue
                     else:
                         page_pdf_bytes = capture_page_as_pdf_bytes(page, cdp_session=cdp_session)
                 else:
                     page_pdf_bytes = capture_page_as_pdf_bytes(page, cdp_session=cdp_session)
+                if kindle_mode and is_kindle_oops(page):
+                    continue
                 if is_pdf_visually_blank(page_pdf_bytes):
                     for retry in range(2):
                         log(f"[Browser] Page {page_idx} rendered blank; waiting and retrying ({retry + 1}/2)...")
                         page.wait_for_timeout(1500)
                         wait_for_page_ready(page, timeout_ms=10000)
-                        page_pdf_bytes = capture_page_as_pdf_bytes(page, cdp_session=cdp_session)
+                        if kindle_mode:
+                            if is_kindle_oops(page):
+                                break
+                            retry_capture = capture_kindle_page_as_pdf_bytes(page)
+                            if retry_capture is not None:
+                                page_pdf_bytes, kindle_png = retry_capture
+                            else:
+                                continue
+                        else:
+                            page_pdf_bytes = capture_page_as_pdf_bytes(page, cdp_session=cdp_session)
                         if not is_pdf_visually_blank(page_pdf_bytes):
                             break
+                    if kindle_mode and is_kindle_oops(page):
+                        continue
                     if is_pdf_visually_blank(page_pdf_bytes):
+                        if kindle_mode and last_kindle_image_hash is not None:
+                            needs_recovery = True
+                            continue
                         if page_idx == 1:
                             raise RuntimeError(
                                 "ページの描画が空（白紙）のままだったためPDFを作成できませんでした。"
@@ -1491,17 +1611,34 @@ def fetch_via_browser(
                     if kindle_mode:
                         for pdf_retry in range(2):
                             log(f"[Kindle] Page {page_idx} PDF content unchanged; retrying turn ({pdf_retry + 1}/2)...")
+                            source = page.evaluate(KINDLE_PAGE_SOURCE)
                             page.keyboard.press(turn_key)
-                            page.wait_for_timeout(2000)
+                            if source:
+                                wait_for_kindle_turn(page, source)
+                            else:
+                                page.wait_for_timeout(2000)
+                            if is_kindle_oops(page):
+                                break
                             k_res_retry = capture_kindle_page_as_pdf_bytes(page)
                             if k_res_retry is not None:
-                                page_pdf_bytes = k_res_retry[0]
-                            else:
+                                page_pdf_bytes, kindle_png = k_res_retry
+                            elif last_kindle_image_hash is None:
                                 page_pdf_bytes = capture_page_as_pdf_bytes(page, cdp_session=cdp_session)
+                            else:
+                                continue
                             current_pdf_hash = pdf_content_signature(page_pdf_bytes)
-                            if current_pdf_hash != prev_pdf_hash:
+                            if current_pdf_hash != prev_pdf_hash and not is_pdf_visually_blank(page_pdf_bytes):
                                 break
+                            current_pdf_hash = prev_pdf_hash
+                    if kindle_mode and is_kindle_oops(page):
+                        continue
                     if prev_pdf_hash == current_pdf_hash:
+                        if kindle_mode and (recovery_attempts or (
+                            expected_total_pages is not None and last_kindle_page is not None
+                            and last_kindle_page < expected_total_pages
+                        )):
+                            needs_recovery = True
+                            continue
                         if kindle_mode:
                             try:
                                 stop_snippet = (page.inner_text("body") or "").replace("\n", " | ")[:200]
@@ -1510,41 +1647,45 @@ def fetch_via_browser(
                                 pass
                         log(f"[Browser] Page {page_idx} PDF content identical to previous; stopping pagination.")
                         break
+                if kindle_mode and is_kindle_oops(page):
+                    continue
+                prev_hash = current_hash
                 prev_pdf_hash = current_pdf_hash
-                collected_page_pdfs.append(page_pdf_bytes)
                 if kindle_mode:
-                    k_num = get_kindle_page_number(page)
-                    if k_num is not None:
-                        last_kindle_page = k_num
+                    last_kindle_image_hash = hashlib.sha256(kindle_png).hexdigest() if kindle_png is not None else None
+                    last_kindle_page = get_kindle_page_number(page)
+                    recovery_attempts = 0
                     k_total = get_kindle_total_pages(page)
                     if k_total is not None:
                         expected_total_pages = k_total
                     k_pct = get_kindle_progress_percent(page)
                     if k_pct is not None:
                         last_kindle_percent = k_pct
+                    if kindle_checkpoint is not None:
+                        kindle_checkpoint.append(page_idx, KindleCapture(
+                            page_pdf_bytes, last_kindle_page, last_kindle_image_hash,
+                            expected_total_pages, last_kindle_percent,
+                            page.viewport_size["height"] if created_page and page.viewport_size else None,
+                        ))
+                collected_page_pdfs.append(page_pdf_bytes)
                 log(f"[Browser] Captured page {page_idx} via PDF command ({len(page_pdf_bytes)} bytes)")
 
+                if len(collected_page_pdfs) == max_pages:
+                    break
                 url_before_turn = page.url
-                prev_kindle_src = (
-                    page.evaluate("() => document.querySelector('img[src^=\"blob:\"]')?.src || ''")
-                    if kindle_mode
-                    else ""
-                )
-                # Press ArrowRight or ArrowLeft to advance to the next page
-                page.keyboard.press(turn_key)
                 if kindle_mode:
-                    page.wait_for_timeout(450)
-                    try:
-                        page.wait_for_function(
-                            "(prev) => { const img = document.querySelector('img[src^=\"blob:\"]'); return img && img.complete && img.src !== prev; }",
-                            arg=prev_kindle_src,
-                            timeout=5000,
-                        )
-                    except Exception:
-                        pass
+                    source = page.evaluate(KINDLE_PAGE_SOURCE)
+                    page.keyboard.press(turn_key)
+                    if source:
+                        # Let the next iteration handle unchanged pages and reader errors.
+                        wait_for_kindle_turn(page, source)
+                        continue
+                    if is_kindle_oops(page):
+                        continue
                 else:
-                    page.wait_for_timeout(500)
-                    wait_for_page_ready(page, timeout_ms=8000)
+                    page.keyboard.press(turn_key)
+                page.wait_for_timeout(500)
+                wait_for_page_ready(page, timeout_ms=8000)
 
                 # If a PDF response was triggered by the page turn, prefer collected PDFs if complete
                 if len(captured_pdfs) > pdf_count_before:
@@ -1564,8 +1705,14 @@ def fetch_via_browser(
                         except Exception:
                             continue
 
-            if captured_pdfs and len(captured_pdfs) >= len(collected_page_pdfs):
+            if not kindle_mode and captured_pdfs and len(captured_pdfs) >= len(collected_page_pdfs):
                 written = merge_pdf_bytes_list(captured_pdfs, resolved_output)
+            elif kindle_mode and kindle_checkpoint is not None:
+                # Publish only the complete PDF, leaving the checkpoint intact if merging fails.
+                with tempfile.TemporaryDirectory(dir=resolved_output.parent) as folder:
+                    staged_output = Path(folder) / resolved_output.name
+                    written = merge_pdf_bytes_list(collected_page_pdfs, staged_output)
+                    staged_output.replace(resolved_output)
             else:
                 written = merge_pdf_bytes_list(collected_page_pdfs, resolved_output)
             try:
@@ -1578,6 +1725,8 @@ def fetch_via_browser(
                 log(f"QUALITY_CHECK={qc['summary']}")
             except Exception as qc_exc:
                 log(f"[Verify] Skipped ({qc_exc})")
+            if kindle_mode and kindle_checkpoint is not None:
+                kindle_checkpoint.remove()
             return written, resolved_output
         finally:
             if created_page:
@@ -1652,12 +1801,22 @@ def main() -> int:
     parser.add_argument("--direction", choices=["right", "left"], default="right", help="Page-turn key direction (default: right)")
     parser.add_argument("--no-browser", action="store_true", help="Disable Playwright browser fallback")
     parser.add_argument("--auto-name", action="store_true", help="Auto-name output as <Title>_<YYYYMMDD>.pdf when available")
+    parser.add_argument("--kindle-checkpoint", type=Path, help="Save and resume captured Kindle pages")
     args = parser.parse_args()
 
     output_path = Path(args.output).expanduser().resolve()
     final_path = output_path
     try:
-        if args.auto_name and not args.no_browser:
+        checkpoint = KindleCheckpoint(args.kindle_checkpoint) if args.kindle_checkpoint else None
+        if checkpoint is not None and not args.no_browser:
+            if not is_http_url(args.url.strip()):
+                raise ValueError("Invalid source URL")
+            total_pages, final_path = fetch_via_browser(
+                args.url.strip(), output_path,
+                max_pages=max(1, args.max_pages), timeout=max(5, args.timeout),
+                direction=args.direction, auto_name=args.auto_name, kindle_checkpoint=checkpoint,
+            )
+        elif args.auto_name and not args.no_browser:
             # Allow fetch_and_merge / fetch_via_browser to resolve final output path
             if not is_http_url(args.url.strip()):
                 raise ValueError(f"Invalid URL (must start with http:// or https://): {args.url.strip()}")

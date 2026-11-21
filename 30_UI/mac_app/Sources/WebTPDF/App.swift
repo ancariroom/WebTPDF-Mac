@@ -253,6 +253,7 @@ final class AppModel: ObservableObject {
     }()
     @Published var historyPageIndex: Int = 0
     @Published var isUpdatingApp: Bool = false
+    @Published private(set) var lastUpdateCheckAt = UserDefaults.standard.object(forKey: "lastUpdateCheckAt") as? Date
     @Published private(set) var isRunningQueue = false
     @Published var isQueueAutoPaused = false
     @Published var squeezerTargetURL: URL?
@@ -1292,6 +1293,11 @@ final class AppModel: ObservableObject {
             guard let self else { return }
             self.stopProgressClock()
             self.isUpdatingApp = false
+            if exitCode == 0 || exitCode == 10 || exitCode == 11 {
+                let checkedAt = Date()
+                self.lastUpdateCheckAt = checkedAt
+                UserDefaults.standard.set(checkedAt, forKey: "lastUpdateCheckAt")
+            }
             switch exitCode {
             case 0:
                 UserDefaults.standard.set(currentDisplay, forKey: "lastUpdatedFromVersion")
@@ -3395,24 +3401,39 @@ struct ContentView: View {
     }
 
     private var updateAppButton: some View {
-        Button {
-            model.updateAndRelaunchApp()
-        } label: {
-            HStack(spacing: 6) {
-                if model.isUpdatingApp {
-                    ProgressView()
-                        .controlSize(.small)
+        HStack(spacing: 12) {
+            VStack(alignment: .trailing, spacing: 3) {
+                Text(model.t("現在のバージョン \(model.appVersionDisplay)", "Installed version \(model.appVersionDisplay)"))
+                    .monospacedDigit()
+                if let checkedAt = model.lastUpdateCheckAt {
+                    let date = checkedAt.formatted(.dateTime.year().month().day().hour().minute())
+                    Text(model.t("最終確認 \(date)", "Last checked \(date)"))
                 } else {
-                    Image(systemName: "arrow.down.circle")
+                    Text(model.t("最終確認 未確認", "Last checked: Never"))
                 }
-                Text(
-                    model.isUpdatingApp
-                        ? model.t("アップデート中...", "Updating...")
-                        : model.t("アプリをアップデート", "Update App")
-                )
             }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            Button {
+                model.updateAndRelaunchApp()
+            } label: {
+                HStack(spacing: 6) {
+                    if model.isUpdatingApp {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: "arrow.down.circle")
+                    }
+                    Text(
+                        model.isUpdatingApp
+                            ? model.t("アップデート中...", "Updating...")
+                            : model.t("アプリをアップデート", "Update App")
+                    )
+                }
+            }
+            .disabled(model.isRunning)
         }
-        .disabled(model.isRunning)
     }
 
     private var dashboardView: some View {

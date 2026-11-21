@@ -602,15 +602,56 @@ def is_kindle_cloud_reader(page) -> bool:
         return False
 
 
-def dismiss_kindle_dialogs(page) -> None:
-    """Dismiss Kindle Cloud Reader modal prompts (e.g. 'Most Recent Page Read') if visible."""
+def dismiss_kindle_dialogs(page) -> bool:
+    """Dismiss Kindle Cloud Reader modal prompts (e.g. 'Most Recent Page Read') if visible.
+
+    Returns True if a 'Most Recent Page Read' prompt was dismissed.
+    """
     try:
-        no_btn = page.locator("button:has-text('No')").first
+        body_text = (page.inner_text("body") or "").lower()
+        is_recent_prompt = (
+            "most recent page read" in body_text
+            or "most recent page" in body_text
+            or "最後に読んだページ" in body_text
+        )
+        no_btn = page.locator("button:has-text('No'), button:has-text('いいえ')").first
         if no_btn.count() > 0 and no_btn.is_visible():
             no_btn.click(timeout=1500)
             page.wait_for_timeout(400)
+            return is_recent_prompt
     except Exception:
         pass
+    return False
+
+
+def rewind_kindle_to_start(page, turn_key: str, max_steps: int = 300) -> None:
+    """Step backwards in Kindle Cloud Reader until reaching the first page (cover)."""
+    reverse_key = "ArrowRight" if turn_key == "ArrowLeft" else "ArrowLeft"
+    log(f"[Kindle] 'Most Recent Page Read' detected; rewinding to first page via {reverse_key}...")
+    unchanged = 0
+    for step in range(max_steps):
+        prev_src = page.evaluate("() => document.querySelector('img[src^=\"blob:\"]')?.src || ''")
+        page.keyboard.press(reverse_key)
+        page.wait_for_timeout(300)
+        changed = False
+        try:
+            page.wait_for_function(
+                "(prev) => { const img = document.querySelector('img[src^=\"blob:\"]'); return img && img.complete && img.src !== prev; }",
+                arg=prev_src,
+                timeout=1200,
+            )
+            changed = True
+        except Exception:
+            cur_src = page.evaluate("() => document.querySelector('img[src^=\"blob:\"]')?.src || ''")
+            changed = bool(cur_src and cur_src != prev_src)
+        if changed:
+            unchanged = 0
+        else:
+            unchanged += 1
+            if unchanged >= 2:
+                log(f"[Kindle] Reached first page after {step + 1} backward step(s).")
+                return
+    log(f"[Kindle] Rewind stopped after {max_steps} steps.")
 
 
 def is_kindle_oops(page) -> bool:
@@ -1192,7 +1233,8 @@ def fetch_via_browser(
 
             for page_idx in range(1, max_pages + 1):
                 if kindle_mode:
-                    dismiss_kindle_dialogs(page)
+                    if dismiss_kindle_dialogs(page) and page_idx == 1:
+                        rewind_kindle_to_start(page, turn_key)
                     if is_kindle_oops(page):
                         recovered = False
                         for attempt in range(3):

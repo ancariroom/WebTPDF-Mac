@@ -2630,10 +2630,16 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 24) {
 
                 HStack(spacing: 10) {
+                    let urlMissing = model.trimmedSourceURL.isEmpty
                     Button {
                         isSourceURLFocused = true
                     } label: {
-                        topologyCard(model.t("① ソースURL", "① Source URL"), symbol: "globe", detail: model.trimmedSourceURL.isEmpty ? model.t("未入力", "Empty") : model.t("入力済み", "Ready"))
+                        topologyCard(
+                            model.t("① ソースURL", "① Source URL"),
+                            symbol: "globe",
+                            detail: urlMissing ? model.t("未入力", "Empty") : model.t("入力済み", "Ready"),
+                            state: urlMissing ? .needsInput : .ready
+                        )
                     }
                     .buttonStyle(.plain)
                     .help(model.t("クリックしてURL入力欄にカーソルを移動", "Click to focus URL input"))
@@ -2643,7 +2649,12 @@ struct ContentView: View {
                     Button {
                         model.pageTurnDirection = model.pageTurnDirection == .left ? .right : .left
                     } label: {
-                        topologyCard(model.t("② ページ送り", "② Pagination"), symbol: model.pageTurnDirection == .left ? "arrow.left.square" : "arrow.right.square", detail: model.pageTurnDirection.label)
+                        topologyCard(
+                            model.t("② ページ送り", "② Pagination"),
+                            symbol: model.pageTurnDirection == .left ? "arrow.left.square" : "arrow.right.square",
+                            detail: model.pageTurnDirection.label,
+                            state: .ready
+                        )
                     }
                     .buttonStyle(.plain)
                     .help(model.t("クリックして右キー・左キーを切り替え", "Click to toggle Left/Right key"))
@@ -2653,7 +2664,12 @@ struct ContentView: View {
                     Button {
                         model.choosePDFSaveDirectory()
                     } label: {
-                        topologyCard(model.t("③ 保存先", "③ Save To"), symbol: "folder", detail: model.fetchedPDFRoot.lastPathComponent)
+                        topologyCard(
+                            model.t("③ 保存先", "③ Save To"),
+                            symbol: "folder",
+                            detail: model.fetchedPDFRoot.lastPathComponent,
+                            state: .ready
+                        )
                     }
                     .buttonStyle(.plain)
                     .help(model.t("クリックして保存先フォルダを変更", "Click to choose save folder"))
@@ -2661,19 +2677,17 @@ struct ContentView: View {
                     Image(systemName: "chevron.right").foregroundStyle(.secondary)
 
                     Button {
-                        if model.canFetchURL {
-                            model.fetchPDFfromURL()
-                        } else {
-                            isSourceURLFocused = true
-                        }
+                        model.fetchPDFfromURL()
                     } label: {
                         topologyCard(
                             model.t("④ PDF保存 / キュー", "④ Save / Queue"),
                             symbol: "arrow.down.doc.fill",
-                            detail: model.canFetchURL ? model.t("クリックで開始", "Click to Start") : model.t("URL入力待ち", "Enter URL")
+                            detail: model.canFetchURL ? model.t("クリックで開始", "Click to Start") : model.t("①〜③を設定してください", "Complete ①–③"),
+                            state: model.canFetchURL ? .actionReady : .disabled
                         )
                     }
                     .buttonStyle(.plain)
+                    .disabled(!model.canFetchURL)
                     .help(model.t("クリックしてPDF保存を実行", "Click to create PDF"))
                 }
                 .padding(20)
@@ -3008,13 +3022,15 @@ struct ContentView: View {
                 }
 
                 HStack(spacing: 10) {
+                    let fileMissing = model.ebookURL == nil
                     Button {
                         model.chooseEbook()
                     } label: {
                         topologyCard(
                             model.t("① ファイル選択", "① Ebook File"),
                             symbol: "doc.text",
-                            detail: model.ebookURL?.lastPathComponent ?? model.t("未選択", "Not selected")
+                            detail: model.ebookURL?.lastPathComponent ?? model.t("未選択", "Not selected"),
+                            state: fileMissing ? .needsInput : .ready
                         )
                     }
                     .buttonStyle(.plain)
@@ -3022,6 +3038,7 @@ struct ContentView: View {
 
                     Image(systemName: "chevron.right").foregroundStyle(.secondary)
 
+                    let langMissing = model.language.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     Button {
                         let formats = AppModel.OutputFormat.allCases
                         if let idx = formats.firstIndex(of: model.outputFormat), !formats.isEmpty {
@@ -3031,7 +3048,8 @@ struct ContentView: View {
                         topologyCard(
                             model.t("② 形式・言語", "② Format"),
                             symbol: "music.note",
-                            detail: "\(model.languageDisplayName(model.language)) · \(model.outputFormat.rawValue)"
+                            detail: "\(model.languageDisplayName(model.language)) · \(model.outputFormat.rawValue)",
+                            state: langMissing ? .needsInput : .ready
                         )
                     }
                     .buttonStyle(.plain)
@@ -3039,17 +3057,20 @@ struct ContentView: View {
 
                     Image(systemName: "chevron.right").foregroundStyle(.secondary)
 
+                    let selectedModel = model.availableTTSModels.first(where: { $0.id == model.selectedTTSModelID })
+                    let modelReady = selectedModel?.installed ?? false
                     Button {
                         let models = model.availableTTSModels
                         if let idx = models.firstIndex(where: { $0.id == model.selectedTTSModelID }), !models.isEmpty {
                             model.selectedTTSModelID = models[(idx + 1) % models.count].id
                         }
                     } label: {
-                        let currentName = model.availableTTSModels.first(where: { $0.id == model.selectedTTSModelID })?.name ?? model.selectedTTSModelID
+                        let currentName = selectedModel?.name ?? model.selectedTTSModelID
                         topologyCard(
                             model.t("③ 音声モデル", "③ Voice Model"),
                             symbol: "waveform",
-                            detail: currentName
+                            detail: currentName,
+                            state: modelReady ? .ready : .needsInput
                         )
                     }
                     .buttonStyle(.plain)
@@ -3057,20 +3078,19 @@ struct ContentView: View {
 
                     Image(systemName: "chevron.right").foregroundStyle(.secondary)
 
+                    let canConvertAudio = model.canRun && !fileMissing && !langMissing && modelReady
                     Button {
-                        if model.canRun {
-                            model.startJob()
-                        } else {
-                            model.chooseEbook()
-                        }
+                        model.startJob()
                     } label: {
                         topologyCard(
                             model.t("④ 音声変換開始", "④ Convert"),
                             symbol: "play.circle.fill",
-                            detail: model.canRun ? model.t("クリックで開始", "Click to Start") : model.t("ファイル選択待ち", "Select File")
+                            detail: canConvertAudio ? model.t("クリックで開始", "Click to Start") : model.t("①〜③を設定してください", "Complete ①–③"),
+                            state: canConvertAudio ? .actionReady : .disabled
                         )
                     }
                     .buttonStyle(.plain)
+                    .disabled(!canConvertAudio)
                     .help(model.t("クリックして音声変換を開始", "Click to start audio conversion"))
                 }
                 .padding(20)
@@ -3428,13 +3448,15 @@ struct ContentView: View {
                 }
 
                 HStack(spacing: 10) {
+                    let targetMissing = model.squeezerTargetURL == nil
                     Button {
                         model.chooseSqueezerPDF()
                     } label: {
                         topologyCard(
                             model.t("① 対象PDF", "① Target"),
                             symbol: "doc.fill",
-                            detail: model.squeezerTargetURL?.lastPathComponent ?? model.t("未選択", "Not selected")
+                            detail: model.squeezerTargetURL?.lastPathComponent ?? model.t("未選択", "Not selected"),
+                            state: targetMissing ? .needsInput : .ready
                         )
                     }
                     .buttonStyle(.plain)
@@ -3451,7 +3473,8 @@ struct ContentView: View {
                         topologyCard(
                             model.t("② 圧縮レベル", "② Preset"),
                             symbol: "slider.horizontal.3",
-                            detail: model.squeezerPreset.label(model.uiLanguage)
+                            detail: model.squeezerPreset.label(model.uiLanguage),
+                            state: .ready
                         )
                     }
                     .buttonStyle(.plain)
@@ -3465,7 +3488,8 @@ struct ContentView: View {
                         topologyCard(
                             model.t("③ 保存方法", "③ Output Mode"),
                             symbol: "arrow.triangle.2.circlepath",
-                            detail: model.squeezerInPlace ? model.t("上書き保存", "Overwrite") : "_compressed.pdf"
+                            detail: model.squeezerInPlace ? model.t("上書き保存", "Overwrite") : "_compressed.pdf",
+                            state: .ready
                         )
                     }
                     .buttonStyle(.plain)
@@ -3473,20 +3497,19 @@ struct ContentView: View {
 
                     Image(systemName: "chevron.right").foregroundStyle(.secondary)
 
+                    let canCompress = !targetMissing && !model.isRunning
                     Button {
-                        if model.squeezerTargetURL != nil && !model.isRunning {
-                            model.runPDFSqueezer()
-                        } else {
-                            model.chooseSqueezerPDF()
-                        }
+                        model.runPDFSqueezer()
                     } label: {
                         topologyCard(
                             model.t("④ PDFを圧縮", "④ Compress"),
                             symbol: "arrow.down.right.and.arrow.up.left.circle.fill",
-                            detail: model.squeezerTargetURL != nil ? model.t("クリックで開始", "Click to Start") : model.t("PDF選択待ち", "Select PDF")
+                            detail: canCompress ? model.t("クリックで開始", "Click to Start") : model.t("①〜③を設定してください", "Complete ①–③"),
+                            state: canCompress ? .actionReady : .disabled
                         )
                     }
                     .buttonStyle(.plain)
+                    .disabled(!canCompress)
                     .help(model.t("クリックしてPDF圧縮を開始", "Click to compress PDF"))
                 }
                 .padding(20)
@@ -3705,30 +3728,65 @@ struct ContentView: View {
         }
     }
 
-    private func topologyCard(_ title: String, symbol: String, detail: String) -> some View {
-        VStack(spacing: 6) {
+    private enum CardStepState {
+        case needsInput
+        case ready
+        case actionReady
+        case disabled
+    }
+
+    private func topologyCard(_ title: String, symbol: String, detail: String, state: CardStepState = .ready) -> some View {
+        let iconColor: Color = {
+            switch state {
+            case .needsInput: return .orange
+            case .ready: return .green
+            case .actionReady: return .accentColor
+            case .disabled: return .secondary
+            }
+        }()
+        let bgColor: Color = {
+            switch state {
+            case .needsInput: return Color.orange.opacity(0.14)
+            case .ready: return Color.green.opacity(0.08)
+            case .actionReady: return Color.accentColor.opacity(0.18)
+            case .disabled: return Color.secondary.opacity(0.10)
+            }
+        }()
+        let borderColor: Color = {
+            switch state {
+            case .needsInput: return Color.orange.opacity(0.75)
+            case .ready: return Color.green.opacity(0.45)
+            case .actionReady: return Color.accentColor.opacity(0.85)
+            case .disabled: return Color.secondary.opacity(0.25)
+            }
+        }()
+        let borderWidth: CGFloat = (state == .needsInput || state == .actionReady) ? 1.5 : 1.0
+
+        return VStack(spacing: 6) {
             Image(systemName: symbol)
                 .font(.title2)
-                .foregroundStyle(.tint)
+                .foregroundStyle(iconColor)
             Text(title)
                 .font(.headline)
+                .foregroundStyle(state == .needsInput ? Color.orange : (state == .disabled ? Color.secondary : Color.primary))
             Text(detail)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(state == .needsInput ? Color.orange.opacity(0.9) : Color.secondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 12)
         .padding(.horizontal, 10)
-        .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 10))
+        .background(bgColor, in: RoundedRectangle(cornerRadius: 10))
         .overlay(
             RoundedRectangle(cornerRadius: 10)
-                .stroke(.secondary.opacity(0.3), lineWidth: 1)
+                .stroke(borderColor, lineWidth: borderWidth)
         )
+        .opacity(state == .disabled ? 0.5 : 1.0)
         .contentShape(RoundedRectangle(cornerRadius: 10))
         .onHover { hovering in
-            if hovering {
+            if hovering && state != .disabled {
                 NSCursor.pointingHand.push()
             } else {
                 NSCursor.pop()

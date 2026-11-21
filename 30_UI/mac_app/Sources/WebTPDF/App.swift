@@ -2604,10 +2604,6 @@ struct ContentView: View {
             .navigationTitle((destination ?? .urlToPDF).title(model.uiLanguage))
             .toolbar {
                 ToolbarItemGroup {
-                    if model.isRunning {
-                        ProgressView()
-                            .controlSize(.small)
-                    }
                     Menu {
                         ForEach(AppModel.UILanguage.allCases) { lang in
                             Button {
@@ -2622,6 +2618,7 @@ struct ContentView: View {
                         }
                     } label: {
                         Text(model.uiLanguage.label)
+                            .padding(.horizontal, 10)
                     }
                     .menuStyle(.borderlessButton)
                     .accessibilityLabel(model.t("言語", "Language"))
@@ -3664,6 +3661,21 @@ struct ContentView: View {
                 .truncationMode(.middle)
         }
         .frame(maxWidth: .infinity)
+        .padding(.vertical, 12)
+        .padding(.horizontal, 10)
+        .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(.secondary.opacity(0.3), lineWidth: 1)
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 10))
+        .onHover { hovering in
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
     }
 
     private func logBox(minHeight: CGFloat) -> some View {

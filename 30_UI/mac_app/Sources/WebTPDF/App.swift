@@ -2508,12 +2508,10 @@ struct ContentView: View {
                         .tag(Destination.dashboard)
                     Label(Destination.urlToPDF.title(model.uiLanguage), systemImage: Destination.urlToPDF.symbol)
                         .tag(Destination.urlToPDF)
-                    Label(Destination.pdfSqueezer.title(model.uiLanguage), systemImage: Destination.pdfSqueezer.symbol)
-                        .tag(Destination.pdfSqueezer)
                     Label(Destination.audioLab.title(model.uiLanguage), systemImage: Destination.audioLab.symbol)
                         .tag(Destination.audioLab)
-                    Label(Destination.library.title(model.uiLanguage), systemImage: Destination.library.symbol)
-                        .tag(Destination.library)
+                    Label(Destination.pdfSqueezer.title(model.uiLanguage), systemImage: Destination.pdfSqueezer.symbol)
+                        .tag(Destination.pdfSqueezer)
                 }
                 Section(model.t("システム", "System")) {
                     Label(Destination.runtime.title(model.uiLanguage), systemImage: Destination.runtime.symbol)

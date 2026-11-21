@@ -2510,7 +2510,7 @@ struct ContentView: View {
             case .dashboard: return lang == .ja ? "ダッシュボード" : "Dashboard"
             case .urlToPDF: return lang == .ja ? "URL → PDF 作成" : "URL to PDF"
             case .pdfSqueezer: return lang == .ja ? "PDF圧縮" : "PDF Squeezer"
-            case .audioLab: return lang == .ja ? "音声変換" : "Audio Lab"
+            case .audioLab: return lang == .ja ? "オーディオブック変換" : "Audiobook"
             case .library: return lang == .ja ? "PDFライブラリ" : "PDF Library"
             case .models: return lang == .ja ? "AI接続" : "AI Connection"
             case .logs: return lang == .ja ? "ログ" : "Logs"
@@ -3029,13 +3029,6 @@ struct ContentView: View {
     private var audioLabView: some View {
         VisibleScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(model.t("電子書籍をオーディオブックに変換", "Convert Ebooks to Audiobooks"))
-                        .font(.title2.bold())
-                    Text(model.t("ローカルの PDF / EPUB / TXT または取得済みPDFを音声化します。", "Convert local or fetched PDF / EPUB / TXT into mp3 or m4b audio."))
-                        .foregroundStyle(.secondary)
-                }
-
                 HStack(spacing: 10) {
                     let fileMissing = model.ebookURL == nil
                     Button {
@@ -3044,7 +3037,7 @@ struct ContentView: View {
                         topologyCard(
                             model.t("① ファイル選択", "① Ebook File"),
                             symbol: "doc.text",
-                            detail: model.ebookURL?.lastPathComponent ?? model.t("未選択", "Not selected"),
+                            detail: model.ebookURL?.lastPathComponent ?? "PDF / EPUB / TXT",
                             state: fileMissing ? .needsInput : .ready
                         )
                     }
@@ -3834,7 +3827,7 @@ struct ContentView: View {
 
     private var inputGroup: some View {
         GroupBox(model.t("入力", "Input")) {
-            VStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 12) {
                 FilePickerRow(
                     title: model.t("① 電子書籍ファイル", "① Ebook File"),
                     url: model.ebookURL,
@@ -3898,13 +3891,12 @@ struct ContentView: View {
     }
 
     private var languageAndFormatRow: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 16) {
             Picker(model.t("② 言語", "② Language"), selection: $model.language) {
                 ForEach(model.availableLanguagesForSelectedModel, id: \.self) { code in
                     Text(model.languageDisplayName(code)).tag(code)
                 }
             }
-            .frame(maxWidth: .infinity)
             .onChange(of: model.selectedTTSModelID) { _, _ in
                 model.syncLanguageForSelectedModel()
             }
@@ -3914,7 +3906,8 @@ struct ContentView: View {
                     Text(format.rawValue).tag(format)
                 }
             }
-            .frame(maxWidth: .infinity)
+
+            Spacer()
         }
     }
 
@@ -3968,16 +3961,16 @@ struct FilePickerRow: View {
     let url: URL?
     let buttonTitle: String
     let action: () -> Void
+    var placeholder: String = "PDF / EPUB / TXT"
     var clearAction: (() -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title)
-                .font(.caption)
-                .foregroundStyle(.secondary)
             HStack {
                 Button(buttonTitle, action: action)
-                Text(url?.path ?? "未選択")
+                Text(url?.path ?? placeholder)
+                    .font(url == nil ? .caption : .body)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .foregroundStyle(url == nil ? .secondary : .primary)

@@ -17,6 +17,7 @@ struct WebTPDFApp: App {
                 .frame(minWidth: 980, minHeight: 680)
                 .onAppear {
                     appDelegate.model = model
+                    model.backfillHistoryPDFPageCounts()
                     model.requestNotificationPermission()
                     model.refreshDockerStatus()
                     model.refreshTTSModels()
@@ -154,8 +155,22 @@ final class AppModel: ObservableObject {
         let outputPath: String?
         let succeeded: Bool
         let errorMessage: String?
-        let pageCount: Int?
-        let expectedPages: Int?
+        var pageCount: Int?
+        var expectedPages: Int?
+
+        var isKindle: Bool {
+            URL(string: url)?.host?.lowercased().hasPrefix("read.amazon.") == true
+        }
+
+        var hasWarning: Bool {
+            guard succeeded else { return true }
+            guard let pageCount, let expectedPages else { return false }
+            return pageCount < expectedPages
+        }
+    }
+
+    private struct KindlePageTotal: Decodable {
+        let expectedPages: Int
     }
 
     private struct URLFetchResult: Decodable, Sendable {
@@ -251,6 +266,8 @@ final class AppModel: ObservableObject {
         }
         return decoded
     }()
+    @Published private(set) var checkingHistoryPageCount: UUID?
+    @Published private(set) var historyPageCountMessages: [UUID: String] = [:]
     @Published var historyPageIndex: Int = 0
     @Published var isUpdatingApp: Bool = false
     @Published private(set) var lastUpdateCheckAt = UserDefaults.standard.object(forKey: "lastUpdateCheckAt") as? Date
@@ -728,6 +745,78 @@ final class AppModel: ObservableObject {
         saveURLFetchHistory()
     }
 
+    func backfillHistoryPDFPageCounts() {
+        let missing = urlFetchHistory.compactMap { entry -> (UUID, String)? in
+            guard entry.pageCount == nil, let path = entry.outputPath else { return nil }
+            return (entry.id, path)
+        }
+        guard !missing.isEmpty else { return }
+        Task {
+            let counts = await Task.detached(priority: .utility) {
+                var result: [UUID: Int] = [:]
+                for (id, path) in missing {
+                    if let count = PDFDocument(url: URL(fileURLWithPath: path))?.pageCount, count > 0 {
+                        result[id] = count
+                    }
+                }
+                return result
+            }.value
+            var changed = false
+            for index in urlFetchHistory.indices where urlFetchHistory[index].pageCount == nil {
+                if let count = counts[urlFetchHistory[index].id] {
+                    urlFetchHistory[index].pageCount = count
+                    changed = true
+                }
+            }
+            if changed { saveURLFetchHistory() }
+        }
+    }
+
+    func checkKindleTotal(for item: URLFetchHistoryItem) {
+        guard item.isKindle, checkingHistoryPageCount == nil, !isRunning else { return }
+        let failure = t(
+            "総ページ数を取得できませんでした。専用ChromeでKindleにログインし、本文にページ番号が表示されるか確認してください。",
+            "Could not read the total. Sign in to Kindle in the login browser and check that the reader shows page numbers."
+        )
+        guard let python = resolvePythonCommand(), let script = resolveURLFetcherScript() else {
+            historyPageCountMessages[item.id] = failure
+            return
+        }
+        checkingHistoryPageCount = item.id
+        historyPageCountMessages[item.id] = nil
+        let resultURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WebTPDF-total-\(UUID().uuidString).json")
+        let lookup = Process()
+        lookup.executableURL = URL(fileURLWithPath: python)
+        lookup.arguments = [script.path, "--url", item.url, "--inspect-kindle-total", "--result-json", resultURL.path]
+        lookup.environment = mergedSubprocessEnvironment()
+        lookup.standardOutput = FileHandle.nullDevice
+        lookup.standardError = FileHandle.nullDevice
+        lookup.terminationHandler = { [weak self] finished in
+            Task { @MainActor in
+                defer { try? FileManager.default.removeItem(at: resultURL) }
+                guard let self else { return }
+                self.checkingHistoryPageCount = nil
+                guard let index = self.urlFetchHistory.firstIndex(where: { $0.id == item.id }) else { return }
+                if finished.terminationStatus == 0,
+                   let data = try? Data(contentsOf: resultURL),
+                   let result = try? JSONDecoder().decode(KindlePageTotal.self, from: data),
+                   result.expectedPages > 0 {
+                    self.urlFetchHistory[index].expectedPages = result.expectedPages
+                    self.saveURLFetchHistory()
+                } else {
+                    self.historyPageCountMessages[item.id] = failure
+                }
+            }
+        }
+        do {
+            try lookup.run()
+        } catch {
+            checkingHistoryPageCount = nil
+            historyPageCountMessages[item.id] = failure
+        }
+    }
+
     func historyItem(forPDF pdfURL: URL) -> URLFetchHistoryItem? {
         let targetPath = pdfURL.standardizedFileURL.path
         return urlFetchHistory.first { item in
@@ -831,7 +920,7 @@ final class AppModel: ObservableObject {
                 self.appendLog("\n[Queue #\(processedCount)] (\(item.direction.label)) \(item.url)\n")
 
                 do {
-                    let (mergedURL, pageCount) = try await self.performURLFetch(urlString: item.url, direction: item.direction)
+                    let (mergedURL, result) = try await self.performURLFetch(urlString: item.url, direction: item.direction)
                     if self.cancelRequested {
                         self.pdfQueue[nextIndex].status = .pending
                         break
@@ -842,7 +931,7 @@ final class AppModel: ObservableObject {
                     self.fetchedPDFURL = mergedURL
                     self.fetchedFromSourceURL = item.url
                     self.outputDirectory = mergedURL.deletingLastPathComponent()
-                    self.recordURLFetchHistory(url: item.url, direction: item.direction, outputURL: mergedURL, succeeded: true, pageCount: pageCount)
+                    self.recordURLFetchHistory(url: item.url, direction: item.direction, outputURL: mergedURL, succeeded: true, pageCount: result.pageCount, expectedPages: result.expectedPages)
                     self.appendLog("[Queue #\(processedCount)] Saved -> \(mergedURL.path)\n")
                 } catch {
                     if self.cancelRequested {
@@ -915,7 +1004,7 @@ final class AppModel: ObservableObject {
             }
 
             do {
-                let (mergedURL, pageCount) = try await self.performURLFetch(urlString: urlString)
+                let (mergedURL, result) = try await self.performURLFetch(urlString: urlString)
                 self.preflightTask = nil
                 self.isFetchingURL = false
                 self.stopProgressClock()
@@ -933,7 +1022,7 @@ final class AppModel: ObservableObject {
                 self.progressText = "100%"
                 self.remainingText = "00:00"
                 self.refreshLibraryPDFs()
-                self.recordURLFetchHistory(url: urlString, direction: pageTurnDirection, outputURL: mergedURL, succeeded: true, pageCount: pageCount)
+                self.recordURLFetchHistory(url: urlString, direction: pageTurnDirection, outputURL: mergedURL, succeeded: true, pageCount: result.pageCount, expectedPages: result.expectedPages)
                 self.appendLog("\nMerged PDF saved to: \(mergedURL.path)\n")
                 self.sendCompletionNotification(
                     title: self.t("PDF作成完了", "PDF Created"),
@@ -1989,7 +2078,7 @@ final class AppModel: ObservableObject {
         return nil
     }
 
-    private func performURLFetch(urlString: String, direction: PageTurnDirection? = nil) async throws -> (URL, Int) {
+    private func performURLFetch(urlString: String, direction: PageTurnDirection? = nil) async throws -> (URL, URLFetchResult) {
         guard let parsed = URL(string: urlString),
               let scheme = parsed.scheme?.lowercased(),
               scheme == "http" || scheme == "https",
@@ -2079,7 +2168,7 @@ final class AppModel: ObservableObject {
                     } else if terminated.terminationStatus == 0,
                               let result, let path = result.outputPath,
                               FileManager.default.fileExists(atPath: path) {
-                        continuation.resume(returning: (URL(fileURLWithPath: path), result.pageCount))
+                        continuation.resume(returning: (URL(fileURLWithPath: path), result))
                     } else if let result, let reason = result.message {
                         let canResume = checkpointURL.map {
                             FileManager.default.fileExists(atPath: $0.path)
@@ -2965,8 +3054,8 @@ struct ContentView: View {
                                 ProgressView()
                                     .controlSize(.small)
                             } else {
-                                Image(systemName: entry.succeeded ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                                    .foregroundStyle(entry.succeeded ? Color.green : Color.orange)
+                                Image(systemName: entry.hasWarning ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                                    .foregroundStyle(entry.hasWarning ? Color.orange : Color.green)
                             }
 
                             VStack(alignment: .leading, spacing: 2) {
@@ -2977,7 +3066,8 @@ struct ContentView: View {
                                 HStack(spacing: 8) {
                                     Text(entry.direction.label)
                                     if let count = entry.pageCount {
-                                        let pages = entry.expectedPages.map { "\(count)/\($0)" } ?? "\(count)"
+                                        let pages = entry.expectedPages.map { "\(count)/\($0)" }
+                                            ?? (entry.isKindle ? model.t("\(count)/不明", "\(count)/unknown") : "\(count)")
                                         Text(model.t("\(pages) ページ", "\(pages) pages"))
                                             .monospacedDigit()
                                     }
@@ -2994,6 +3084,21 @@ struct ContentView: View {
                                 }
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
+                                if entry.isKindle && entry.expectedPages == nil && entry.pageCount != nil {
+                                    if let notice = model.historyPageCountMessages[entry.id] {
+                                        Text(notice)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Button(model.checkingHistoryPageCount == entry.id
+                                           ? model.t("確認中…", "Checking…")
+                                           : model.t("総ページ数を確認", "Check total pages")) {
+                                        model.checkKindleTotal(for: entry)
+                                    }
+                                    .buttonStyle(.link)
+                                    .font(.caption2)
+                                    .disabled(model.checkingHistoryPageCount != nil || model.isRunning)
+                                }
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
 

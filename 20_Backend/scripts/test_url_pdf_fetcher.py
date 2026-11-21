@@ -281,9 +281,13 @@ class UrlPdfFetcherTests(unittest.TestCase):
             reader.write_text(
                 html.replace("FAIL_CONDITION", "next === 26 && !failedOnce"), encoding="utf-8"
             )
-            count, result = fetcher.fetch_via_browser(url, output, 28, 10, kindle_checkpoint=checkpoint)
+            args[args.index("--max-pages") + 1] = "28"
+            with patch.object(sys, "argv", args):
+                self.assertEqual(fetcher.main(), 0)
+            status = json.loads(report.read_text(encoding="utf-8"))
 
-        self.assertEqual((count, result), (28, output))
+        self.assertEqual((status["pageCount"], status["expectedPages"]), (28, 28))
+        self.assertEqual(Path(status["outputPath"]), output.resolve())
         self.assertFalse(checkpoint.path.exists())
         with fitz.open(output) as pdf:
             for number, page in enumerate(pdf, 1):

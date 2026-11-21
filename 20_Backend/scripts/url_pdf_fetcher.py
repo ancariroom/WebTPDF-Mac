@@ -721,7 +721,7 @@ def get_kindle_page_number(page) -> int | None:
 def get_kindle_total_pages(page) -> int | None:
     """Extract total page count from Kindle Cloud Reader footer when available."""
     try:
-        body_text = page.inner_text("body") or ""
+        body_text = page.inner_text("body", timeout=1000) or ""
         m = re.search(r"Page\s+\d+\s+of\s+(\d+)", body_text, re.IGNORECASE)
         if m:
             return int(m.group(1))
@@ -731,6 +731,41 @@ def get_kindle_total_pages(page) -> int | None:
     except Exception:
         pass
     return None
+
+
+KINDLE_READER_HOSTS = {
+    "read.amazon.co.jp", "read.amazon.com", "read.amazon.co.uk", "read.amazon.ca",
+    "read.amazon.de", "read.amazon.fr", "read.amazon.it", "read.amazon.es",
+    "read.amazon.com.au", "read.amazon.in", "read.amazon.com.br", "read.amazon.com.mx",
+}
+
+
+def inspect_kindle_total_pages(url: str) -> int | None:
+    """Read the book's page count from a temporary tab in the logged-in browser."""
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in KINDLE_READER_HOSTS or parsed.username or parsed.password:
+        raise ValueError("Expected a Kindle Cloud Reader URL")
+    endpoint = resolve_cdp_url()
+    if endpoint is None:
+        raise RuntimeError("Open the app's login browser and sign in to Kindle first.")
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp(endpoint)
+        page = browser.contexts[0].new_page()
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if is_kindle_oops(page):
+                    return None
+                total = get_kindle_total_pages(page)
+                if total is not None:
+                    return total
+                page.wait_for_timeout(400)
+            return None
+        finally:
+            page.close()
 
 
 def get_kindle_progress_percent(page) -> int | None:
@@ -1331,6 +1366,7 @@ def fetch_via_browser(
     direction: str = "right",
     auto_name: bool = False,
     kindle_checkpoint: KindleCheckpoint | None = None,
+    result_details: dict[str, int] | None = None,
 ) -> tuple[int, Path]:
     """Use CDP (logged-in Chrome) or headless Chromium to paginate with ArrowRight/ArrowLeft and capture PDFs."""
     from playwright.sync_api import sync_playwright
@@ -1755,6 +1791,8 @@ def fetch_via_browser(
                 log(f"[Verify] Skipped ({qc_exc})")
             if kindle_mode and kindle_checkpoint is not None:
                 kindle_checkpoint.remove()
+            if result_details is not None and expected_total_pages is not None:
+                result_details["expectedPages"] = expected_total_pages
             return written, resolved_output
         finally:
             if created_page:
@@ -1823,7 +1861,7 @@ def fetch_and_merge(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Fetch PDF(s) from a URL with pagination and merge into one PDF.")
     parser.add_argument("--url", required=True, help="Source URL")
-    parser.add_argument("--output", required=True, help="Output merged PDF path")
+    parser.add_argument("--output", help="Output merged PDF path")
     parser.add_argument("--max-pages", type=int, default=1000, help="Maximum pages to paginate (default: 1000)")
     parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout in seconds (default: 30)")
     parser.add_argument("--direction", choices=["right", "left"], default="right", help="Page-turn key direction (default: right)")
@@ -1831,8 +1869,25 @@ def main() -> int:
     parser.add_argument("--auto-name", action="store_true", help="Auto-name output as <Title>_<YYYYMMDD>.pdf when available")
     parser.add_argument("--kindle-checkpoint", type=Path, help="Save and resume captured Kindle pages")
     parser.add_argument("--result-json", type=Path, help="Write the output path and page count for the app")
+    parser.add_argument("--inspect-kindle-total", action="store_true", help="Read only the Kindle book's total page count")
     args = parser.parse_args()
 
+    if args.inspect_kindle_total:
+        if args.result_json is None:
+            parser.error("--inspect-kindle-total requires --result-json")
+        try:
+            total = inspect_kindle_total_pages(args.url)
+            if total is None:
+                raise RuntimeError("Kindle did not show a total page count.")
+            args.result_json.write_text(json.dumps({"expectedPages": total}), encoding="utf-8")
+            return 0
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr, flush=True)
+            return 1
+
+    if not args.output:
+        parser.error("--output is required for PDF capture")
+    result_details: dict[str, int] = {}
     output_path = Path(args.output).expanduser().resolve()
     final_path = output_path
     try:
@@ -1844,6 +1899,7 @@ def main() -> int:
                 args.url.strip(), output_path,
                 max_pages=max(1, args.max_pages), timeout=max(5, args.timeout),
                 direction=args.direction, auto_name=args.auto_name, kindle_checkpoint=checkpoint,
+                result_details=result_details,
             )
         elif args.auto_name and not args.no_browser:
             # Allow fetch_and_merge / fetch_via_browser to resolve final output path
@@ -1903,6 +1959,7 @@ def main() -> int:
         args.result_json.write_text(json.dumps({
             "outputPath": str(final_path),
             "pageCount": total_pages,
+            **result_details,
         }), encoding="utf-8")
     log(f"OUTPUT_PDF={final_path}")
     log(f"PAGES={total_pages}")

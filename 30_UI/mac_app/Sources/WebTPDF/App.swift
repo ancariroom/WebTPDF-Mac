@@ -236,6 +236,7 @@ final class AppModel: ObservableObject {
         return decoded
     }()
     @Published var historyPageIndex: Int = 0
+    @Published var isUpdatingApp: Bool = false
     @Published private(set) var isRunningQueue = false
     @Published var isQueueAutoPaused = false
     @Published var squeezerTargetURL: URL?
@@ -1220,6 +1221,7 @@ final class AppModel: ObservableObject {
         let currentDisplay = appVersionDisplay
         let currentSHA = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         cancelRequested = false
+        isUpdatingApp = true
         runState = .running
         statusMessage = t("アップデート中 (\(currentDisplay) -> 最新版)...", "Updating (\(currentDisplay) -> latest)...")
         progressFraction = nil
@@ -1251,6 +1253,7 @@ final class AppModel: ObservableObject {
         ) { [weak self] exitCode in
             guard let self else { return }
             self.stopProgressClock()
+            self.isUpdatingApp = false
             if exitCode == 0 {
                 UserDefaults.standard.set(currentDisplay, forKey: "lastUpdatedFromVersion")
                 self.runState = .completed
@@ -2496,8 +2499,27 @@ struct ContentView: View {
         }
     }
 
+    enum SettingsTab: String, CaseIterable, Identifiable {
+        case general
+        case runtime
+        case models
+        case logs
+
+        var id: String { rawValue }
+
+        func title(_ lang: AppModel.UILanguage) -> String {
+            switch self {
+            case .general: return lang == .ja ? "基本設定" : "General"
+            case .runtime: return lang == .ja ? "実行環境" : "Runtime"
+            case .models: return lang == .ja ? "AI接続" : "AI Connection"
+            case .logs: return lang == .ja ? "ログ" : "Logs"
+            }
+        }
+    }
+
     @ObservedObject var model: AppModel
     @State private var destination: Destination? = .dashboard
+    @State private var settingsTab: SettingsTab = .general
     @State private var confirmClearRecentPDFs = false
 
     var body: some View {
@@ -2514,12 +2536,6 @@ struct ContentView: View {
                         .tag(Destination.pdfSqueezer)
                 }
                 Section(model.t("システム", "System")) {
-                    Label(Destination.runtime.title(model.uiLanguage), systemImage: Destination.runtime.symbol)
-                        .tag(Destination.runtime)
-                    Label(Destination.models.title(model.uiLanguage), systemImage: Destination.models.symbol)
-                        .tag(Destination.models)
-                    Label(Destination.logs.title(model.uiLanguage), systemImage: Destination.logs.symbol)
-                        .tag(Destination.logs)
                     Label(Destination.settings.title(model.uiLanguage), systemImage: Destination.settings.symbol)
                         .tag(Destination.settings)
                 }
@@ -2631,7 +2647,13 @@ struct ContentView: View {
                     Image(systemName: "chevron.right").foregroundStyle(.secondary)
                     topologyCard(model.t("ページ送り", "Pagination"), symbol: model.pageTurnDirection == .left ? "arrow.left.square" : "arrow.right.square", detail: model.pageTurnDirection.label)
                     Image(systemName: "chevron.right").foregroundStyle(.secondary)
-                    topologyCard(model.t("保存先", "Save To"), symbol: "folder", detail: model.fetchedPDFURL?.lastPathComponent ?? model.fetchedPDFRoot.lastPathComponent)
+                    Button {
+                        model.choosePDFSaveDirectory()
+                    } label: {
+                        topologyCard(model.t("保存先", "Save To"), symbol: "folder", detail: model.fetchedPDFRoot.lastPathComponent)
+                    }
+                    .buttonStyle(.plain)
+                    .help(model.t("クリックして保存先フォルダを変更", "Click to choose save folder"))
                 }
                 .padding(20)
                 .frame(maxWidth: .infinity)
@@ -3247,17 +3269,35 @@ struct ContentView: View {
                     }
                     .disabled(model.isRunning)
 
-                    Button(model.t("アプリをアップデート", "Update App"), systemImage: "arrow.down.circle") {
-                        model.updateAndRelaunchApp()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(model.isRunning)
+                    updateAppButton
+                        .buttonStyle(.borderedProminent)
                 }
 
                 logBox(minHeight: 160)
             }
             .padding(28)
         }
+    }
+
+    private var updateAppButton: some View {
+        Button {
+            model.updateAndRelaunchApp()
+        } label: {
+            HStack(spacing: 6) {
+                if model.isUpdatingApp {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: "arrow.down.circle")
+                }
+                Text(
+                    model.isUpdatingApp
+                        ? model.t("アップデート中...", "Updating...")
+                        : model.t("アプリをアップデート", "Update App")
+                )
+            }
+        }
+        .disabled(model.isRunning)
     }
 
     private var dashboardView: some View {
@@ -3267,12 +3307,12 @@ struct ContentView: View {
                     Button("URL → PDF 作成を開く") { destination = .urlToPDF }
                         .buttonStyle(.borderedProminent)
                     Button("音声変換を開く") { destination = .audioLab }
-                    Button(model.t("AI接続を開く", "Open AI Connection")) { destination = .models }
-                    Spacer()
-                    Button(model.t("アプリをアップデート", "Update App"), systemImage: "arrow.down.circle") {
-                        model.updateAndRelaunchApp()
+                    Button(model.t("システム設定を開く", "Open Settings")) {
+                        settingsTab = .general
+                        destination = .settings
                     }
-                    .disabled(model.isRunning)
+                    Spacer()
+                    updateAppButton
                 }
 
                 dashboardRuntimeBox
@@ -3492,27 +3532,50 @@ struct ContentView: View {
     }
 
     private var settingsView: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("システム設定")
-                        .font(.title2.bold())
-                    Text(model.t("PDF取得時のページ送り上限を設定します。", "Set the maximum number of page turns for PDF capture."))
-                        .foregroundStyle(.secondary)
-                }
-
-                GroupBox(model.t("PDF取得設定", "PDF Capture Settings")) {
-                    HStack {
-                        Text(model.t("最大ページ送り数", "Maximum Page Turns"))
-                        Spacer()
-                        TextField("1000", text: $model.maxPagesSetting)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 100)
-                    }
-                    .padding(8)
+        VStack(spacing: 0) {
+            Picker("", selection: $settingsTab) {
+                ForEach(SettingsTab.allCases) { tab in
+                    Text(tab.title(model.uiLanguage)).tag(tab)
                 }
             }
-            .padding(28)
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 28)
+            .padding(.top, 20)
+            .padding(.bottom, 8)
+
+            Divider()
+
+            switch settingsTab {
+            case .general:
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 24) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("システム設定")
+                                .font(.title2.bold())
+                            Text(model.t("PDF取得時のページ送り上限を設定します。", "Set the maximum number of page turns for PDF capture."))
+                                .foregroundStyle(.secondary)
+                        }
+
+                        GroupBox(model.t("PDF取得設定", "PDF Capture Settings")) {
+                            HStack {
+                                Text(model.t("最大ページ送り数", "Maximum Page Turns"))
+                                Spacer()
+                                TextField("1000", text: $model.maxPagesSetting)
+                                    .textFieldStyle(.roundedBorder)
+                                    .frame(width: 100)
+                            }
+                            .padding(8)
+                        }
+                    }
+                    .padding(28)
+                }
+            case .runtime:
+                runtimeView
+            case .models:
+                modelsView
+            case .logs:
+                systemLogsView
+            }
         }
     }
 
@@ -3607,7 +3670,13 @@ struct ContentView: View {
 
                 sampleOptions
 
-                Toggle("dry-run", isOn: $model.dryRun)
+                Toggle(
+                    model.t(
+                        "ドライラン（音声ファイルは作らず、設定や出力先のテストのみ実行）",
+                        "Dry-run (test settings and output path without generating audio)"
+                    ),
+                    isOn: $model.dryRun
+                )
             }
             .padding(8)
         }

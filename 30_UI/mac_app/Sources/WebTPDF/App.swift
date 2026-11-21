@@ -2706,7 +2706,7 @@ struct ContentView: View {
                             Spacer()
                         }
 
-                        HStack(spacing: 8) {
+                        HStack(spacing: 10) {
                             Text(model.t("③ 保存先フォルダ", "③ Save Folder"))
                                 .font(.callout)
                                 .foregroundStyle(.secondary)
@@ -2714,7 +2714,6 @@ struct ContentView: View {
                                 .font(.caption)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
-                                .frame(maxWidth: .infinity, alignment: .leading)
                             Button(model.t("変更", "Choose")) {
                                 model.choosePDFSaveDirectory()
                             }
@@ -2723,6 +2722,7 @@ struct ContentView: View {
                                     model.resetPDFSaveDirectory()
                                 }
                             }
+                            Spacer()
                         }
 
                         HStack(spacing: 10) {
@@ -3007,10 +3007,80 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                 }
 
+                HStack(spacing: 10) {
+                    Button {
+                        model.chooseEbook()
+                    } label: {
+                        topologyCard(
+                            model.t("① ファイル選択", "① Ebook File"),
+                            symbol: "doc.text",
+                            detail: model.ebookURL?.lastPathComponent ?? model.t("未選択", "Not selected")
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .help(model.t("クリックして変換するファイルを選択", "Click to choose ebook file"))
+
+                    Image(systemName: "chevron.right").foregroundStyle(.secondary)
+
+                    Button {
+                        let formats = AppModel.OutputFormat.allCases
+                        if let idx = formats.firstIndex(of: model.outputFormat), !formats.isEmpty {
+                            model.outputFormat = formats[(idx + 1) % formats.count]
+                        }
+                    } label: {
+                        topologyCard(
+                            model.t("② 形式・言語", "② Format"),
+                            symbol: "music.note",
+                            detail: "\(model.languageDisplayName(model.language)) · \(model.outputFormat.rawValue)"
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .help(model.t("クリックして出力形式（mp3 / m4b）を切り替え", "Click to toggle output format"))
+
+                    Image(systemName: "chevron.right").foregroundStyle(.secondary)
+
+                    Button {
+                        let models = model.availableTTSModels
+                        if let idx = models.firstIndex(where: { $0.id == model.selectedTTSModelID }), !models.isEmpty {
+                            model.selectedTTSModelID = models[(idx + 1) % models.count].id
+                        }
+                    } label: {
+                        let currentName = model.availableTTSModels.first(where: { $0.id == model.selectedTTSModelID })?.name ?? model.selectedTTSModelID
+                        topologyCard(
+                            model.t("③ 音声モデル", "③ Voice Model"),
+                            symbol: "waveform",
+                            detail: currentName
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .help(model.t("クリックして音声モデルを切り替え", "Click to cycle voice model"))
+
+                    Image(systemName: "chevron.right").foregroundStyle(.secondary)
+
+                    Button {
+                        if model.canRun {
+                            model.startJob()
+                        } else {
+                            model.chooseEbook()
+                        }
+                    } label: {
+                        topologyCard(
+                            model.t("④ 音声変換開始", "④ Convert"),
+                            symbol: "play.circle.fill",
+                            detail: model.canRun ? model.t("クリックで開始", "Click to Start") : model.t("ファイル選択待ち", "Select File")
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .help(model.t("クリックして音声変換を開始", "Click to start audio conversion"))
+                }
+                .padding(20)
+                .frame(maxWidth: .infinity)
+                .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 12))
+
                 inputGroup
 
                 HStack {
-                    Button(model.t("音声変換を開始 (mp3/m4b)", "Start Audio Conversion (mp3/m4b)")) {
+                    Button(model.t("④ 音声変換を開始 (mp3/m4b)", "④ Start Audio Conversion (mp3/m4b)")) {
                         model.startJob()
                     }
                     .buttonStyle(.borderedProminent)
@@ -3357,10 +3427,76 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                 }
 
+                HStack(spacing: 10) {
+                    Button {
+                        model.chooseSqueezerPDF()
+                    } label: {
+                        topologyCard(
+                            model.t("① 対象PDF", "① Target"),
+                            symbol: "doc.fill",
+                            detail: model.squeezerTargetURL?.lastPathComponent ?? model.t("未選択", "Not selected")
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .help(model.t("クリックして圧縮するPDFを選択", "Click to choose target PDF"))
+
+                    Image(systemName: "chevron.right").foregroundStyle(.secondary)
+
+                    Button {
+                        let presets = AppModel.PDFCompressionPreset.allCases
+                        if let idx = presets.firstIndex(of: model.squeezerPreset), !presets.isEmpty {
+                            model.squeezerPreset = presets[(idx + 1) % presets.count]
+                        }
+                    } label: {
+                        topologyCard(
+                            model.t("② 圧縮レベル", "② Preset"),
+                            symbol: "slider.horizontal.3",
+                            detail: model.squeezerPreset.label(model.uiLanguage)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .help(model.t("クリックして圧縮レベルを切り替え", "Click to cycle compression preset"))
+
+                    Image(systemName: "chevron.right").foregroundStyle(.secondary)
+
+                    Button {
+                        model.squeezerInPlace.toggle()
+                    } label: {
+                        topologyCard(
+                            model.t("③ 保存方法", "③ Output Mode"),
+                            symbol: "arrow.triangle.2.circlepath",
+                            detail: model.squeezerInPlace ? model.t("上書き保存", "Overwrite") : "_compressed.pdf"
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .help(model.t("クリックして上書き／別名保存を切り替え", "Click to toggle overwrite or _compressed.pdf"))
+
+                    Image(systemName: "chevron.right").foregroundStyle(.secondary)
+
+                    Button {
+                        if model.squeezerTargetURL != nil && !model.isRunning {
+                            model.runPDFSqueezer()
+                        } else {
+                            model.chooseSqueezerPDF()
+                        }
+                    } label: {
+                        topologyCard(
+                            model.t("④ PDFを圧縮", "④ Compress"),
+                            symbol: "arrow.down.right.and.arrow.up.left.circle.fill",
+                            detail: model.squeezerTargetURL != nil ? model.t("クリックで開始", "Click to Start") : model.t("PDF選択待ち", "Select PDF")
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .help(model.t("クリックしてPDF圧縮を開始", "Click to compress PDF"))
+                }
+                .padding(20)
+                .frame(maxWidth: .infinity)
+                .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 12))
+
                 GroupBox(model.t("圧縮設定", "Compression Settings")) {
                     VStack(alignment: .leading, spacing: 14) {
                         HStack(spacing: 10) {
-                            Text(model.t("対象", "Target"))
+                            Text(model.t("① 対象", "① Target"))
                                 .font(.callout)
                                 .foregroundStyle(.secondary)
                             Text(model.squeezerTargetURL?.path ?? model.t("未選択", "Not selected"))
@@ -3379,10 +3515,10 @@ struct ContentView: View {
                         }
 
                         HStack(spacing: 12) {
-                            Text(model.t("圧縮プリセット", "Preset"))
+                            Text(model.t("② 圧縮プリセット", "② Preset"))
                                 .font(.callout)
                                 .foregroundStyle(.secondary)
-                            Picker(model.t("圧縮プリセット", "Preset"), selection: $model.squeezerPreset) {
+                            Picker(model.t("② 圧縮プリセット", "② Preset"), selection: $model.squeezerPreset) {
                                 ForEach(AppModel.PDFCompressionPreset.allCases) { preset in
                                     Text(preset.label(model.uiLanguage)).tag(preset)
                                 }
@@ -3392,13 +3528,13 @@ struct ContentView: View {
                         }
 
                         Toggle(
-                            model.t("元のファイルを置き換える（オフの場合は _compressed.pdf を作成）", "Overwrite original file(s) (creates _compressed.pdf when off)"),
+                            model.t("③ 元のファイルを置き換える（オフの場合は _compressed.pdf を作成）", "③ Overwrite original file(s) (creates _compressed.pdf when off)"),
                             isOn: $model.squeezerInPlace
                         )
                         .disabled(model.isRunning)
 
                         HStack(spacing: 10) {
-                            Button(model.t("PDFを圧縮", "Compress PDF(s)")) {
+                            Button(model.t("④ PDFを圧縮", "④ Compress PDF(s)")) {
                                 model.runPDFSqueezer()
                             }
                             .buttonStyle(.borderedProminent)
@@ -3627,7 +3763,7 @@ struct ContentView: View {
         GroupBox(model.t("入力", "Input")) {
             VStack(spacing: 12) {
                 FilePickerRow(
-                    title: model.t("電子書籍ファイル", "Ebook File"),
+                    title: model.t("① 電子書籍ファイル", "① Ebook File"),
                     url: model.ebookURL,
                     buttonTitle: model.t("選択", "Choose"),
                     action: { model.chooseEbook() },
@@ -3655,7 +3791,7 @@ struct ContentView: View {
     private var localModelSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
-                Picker("音声モデル", selection: $model.selectedTTSModelID) {
+                Picker("③ 音声モデル", selection: $model.selectedTTSModelID) {
                     ForEach(model.availableTTSModels) { item in
                         Text(item.installed ? "\(item.name) [済]" : "\(item.name) [未DL]")
                             .tag(item.id)
@@ -3690,7 +3826,7 @@ struct ContentView: View {
 
     private var languageAndFormatRow: some View {
         HStack(spacing: 12) {
-            Picker(model.t("言語", "Language"), selection: $model.language) {
+            Picker(model.t("② 言語", "② Language"), selection: $model.language) {
                 ForEach(model.availableLanguagesForSelectedModel, id: \.self) { code in
                     Text(model.languageDisplayName(code)).tag(code)
                 }

@@ -1202,6 +1202,7 @@ final class AppModel: ObservableObject {
         }
 
         let currentDisplay = appVersionDisplay
+        let currentSHA = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         cancelRequested = false
         runState = .running
         statusMessage = t("アップデート中 (\(currentDisplay) -> 最新版)...", "Updating (\(currentDisplay) -> latest)...")
@@ -1214,15 +1215,15 @@ final class AppModel: ObservableObject {
         let script = """
         set -e
         cd "\(repoRoot.path)"
-        BEFORE_CNT=$(git rev-list --count HEAD)
-        BEFORE_SHA=$(git rev-parse --short HEAD)
+        RUNNING_DISPLAY="\(currentDisplay)"
+        RUNNING_SHA="\(currentSHA)"
         git pull --ff-only origin main
         AFTER_CNT=$(git rev-list --count HEAD)
         AFTER_SHA=$(git rev-parse --short HEAD)
-        echo "Version: v0.1.${BEFORE_CNT} (${BEFORE_SHA}) -> v0.1.${AFTER_CNT} (${AFTER_SHA})"
-        if [ "$BEFORE_SHA" != "$AFTER_SHA" ]; then
+        echo "Version: ${RUNNING_DISPLAY} -> v0.1.${AFTER_CNT} (${AFTER_SHA})"
+        if [ -n "$RUNNING_SHA" ] && [ "$RUNNING_SHA" != "$AFTER_SHA" ]; then
           echo "Changes:"
-          git log --oneline "${BEFORE_SHA}..${AFTER_SHA}"
+          git log --oneline "${RUNNING_SHA}..${AFTER_SHA}" || true
         fi
         zsh "30_UI/mac_app/build_mac_app.sh"
         """

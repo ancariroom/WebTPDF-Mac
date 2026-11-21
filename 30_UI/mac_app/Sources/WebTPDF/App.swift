@@ -1267,6 +1267,11 @@ final class AppModel: ObservableObject {
             return
         }
 
+        guard !isRunning,
+              let updater = Bundle.main.url(forResource: "update_mac_app", withExtension: "sh") else {
+            return
+        }
+        let installedApp = Bundle.main.bundleURL.path
         let currentDisplay = appVersionDisplay
         let currentSHA = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         cancelRequested = false
@@ -1279,50 +1284,36 @@ final class AppModel: ObservableObject {
         logText = "Current app version: \(currentDisplay)\nUpdating WebTPDF Mac from \(repoRoot.path)...\n"
         startProgressClock()
 
-        let script = """
-        set -e
-        cd "\(repoRoot.path)"
-        RUNNING_DISPLAY="\(currentDisplay)"
-        RUNNING_SHA="\(currentSHA)"
-        git pull --ff-only origin main
-        AFTER_CNT=$(git rev-list --count HEAD)
-        AFTER_SHA=$(git rev-parse --short HEAD)
-        echo "Version: ${RUNNING_DISPLAY} -> v0.1.${AFTER_CNT} (${AFTER_SHA})"
-        if [ -n "$RUNNING_SHA" ] && [ "$RUNNING_SHA" = "$AFTER_SHA" ]; then
-          echo "NO_UPDATE_NEEDED=1"
-          exit 0
-        fi
-        if [ -n "$RUNNING_SHA" ] && [ "$RUNNING_SHA" != "$AFTER_SHA" ]; then
-          echo "Changes:"
-          git log --oneline "${RUNNING_SHA}..${AFTER_SHA}" || true
-        fi
-        zsh "30_UI/mac_app/build_mac_app.sh"
-        """
-
         runPythonSubprocess(
             pythonCommand: "/bin/zsh",
-            arguments: ["-c", script],
+            arguments: [updater.path, currentSHA, installedApp],
             workingDirectory: repoRoot
         ) { [weak self] exitCode in
             guard let self else { return }
             self.stopProgressClock()
             self.isUpdatingApp = false
-            if exitCode == 0 {
-                if self.logText.contains("NO_UPDATE_NEEDED=1") {
-                    self.runState = .completed
-                    self.statusMessage = self.t("すでに最新版です (\(currentDisplay))", "Already up to date (\(currentDisplay))")
-                    return
-                }
+            switch exitCode {
+            case 0:
                 UserDefaults.standard.set(currentDisplay, forKey: "lastUpdatedFromVersion")
                 self.runState = .completed
                 self.statusMessage = self.t("アップデート完了・再起動中...", "Update complete. Relaunching...")
-                let appPath = repoRoot.appendingPathComponent("40_Ops/apps/WebTPDF Mac.app").path
                 let relaunch = Process()
                 relaunch.executableURL = URL(fileURLWithPath: "/bin/zsh")
-                relaunch.arguments = ["-c", "sleep 1 && open \"\(appPath)\""]
-                try? relaunch.run()
-                NSApp.terminate(nil)
-            } else {
+                relaunch.arguments = ["-c", #"sleep 1 && /usr/bin/open "$1""#, "webtpdf-relaunch", installedApp]
+                do {
+                    try relaunch.run()
+                    NSApp.terminate(nil)
+                } catch {
+                    self.fail(self.t("更新しました。アプリを開き直してください。", "Updated. Reopen the app to use the new build."))
+                }
+            case 10:
+                self.runState = .completed
+                self.statusMessage = self.t("すでに最新版です (\(currentDisplay))", "Already up to date (\(currentDisplay))")
+            case 11:
+                self.runState = .completed
+                self.statusMessage = self.t("現在の修正を含む更新版はまだありません。", "No update containing the current build is available yet.")
+                self.appendLog("\n\(self.statusMessage)\n")
+            default:
                 self.fail(self.t("アップデートに失敗しました (exit \(exitCode))。", "Update failed (exit \(exitCode))."))
             }
         }

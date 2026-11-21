@@ -964,6 +964,65 @@ def wait_for_kindle_turn(page, previous_source: str, timeout_ms: int = 5000) -> 
         page.wait_for_timeout(250)
 
 
+KINDLE_TOC_NAME = re.compile(r"^(?:Table of Contents|Contents|目次)$", re.IGNORECASE)
+
+
+def jump_to_kindle_chapter(page, offset: int) -> bool:
+    """Open the reader's TOC and select the current or immediately following chapter."""
+    previous_source = page.evaluate(KINDLE_PAGE_SOURCE)
+    toggle = page.get_by_role("button", name=KINDLE_TOC_NAME).or_(
+        page.locator("#kr-toc-button, #kindle-toc-button, [data-testid='toc-button']")
+    )
+    for button in toggle.all():
+        if button.is_visible():
+            button.click(timeout=2000)
+            break
+    else:
+        return False
+
+    heading = page.get_by_role("heading", name=KINDLE_TOC_NAME).filter(visible=True).first
+    if not heading.count():
+        heading = page.get_by_text(KINDLE_TOC_NAME, exact=True).filter(visible=True).last
+    try:
+        heading.wait_for(state="visible", timeout=2000)
+        panel = heading.locator("xpath=..")
+        entry_selector = "button, a, [role=option], [role=menuitem], [role=button], li[tabindex]"
+        for _ in range(4):
+            if panel.evaluate("node => node === document.body || node === document.documentElement"):
+                break
+            target_index = panel.evaluate("""(panel, {selector, offset}) => {
+                const entries = [...panel.querySelectorAll(selector)];
+                const chapters = entries.filter(node =>
+                    node.getClientRects().length && node.textContent.trim() &&
+                    !node.querySelector(selector) && !node.disabled &&
+                    node.getAttribute('aria-disabled') !== 'true'
+                );
+                const selected = chapters.findIndex(node => {
+                    const active = node.closest(
+                        '[aria-current]:not([aria-current="false"]), [aria-selected="true"], '
+                        + '[data-selected="true"], .selected, [class*="toc-item-selected" i]'
+                    );
+                    return active && active !== panel && panel.contains(active);
+                });
+                if (selected < 0) return null;
+                return entries.indexOf(chapters[selected + offset]);
+            }""", {"selector": entry_selector, "offset": offset})
+            if target_index is not None:
+                if target_index < 0:
+                    return False
+                panel.locator(entry_selector).nth(target_index).click(timeout=3000)
+                # The menu must not obscure either the chapter or the checkpoint image.
+                heading.wait_for(state="hidden", timeout=2500)
+                if offset == 0 and page.evaluate(KINDLE_PAGE_SOURCE) and not is_kindle_oops(page):
+                    return True
+                return wait_for_kindle_turn(page, previous_source)
+            panel = panel.locator("xpath=..")
+        return False
+    finally:
+        if heading.is_visible() and button.is_visible():
+            button.click(timeout=2000)
+
+
 def recover_kindle_oops(
     page,
     start_url: str,
@@ -971,6 +1030,7 @@ def recover_kindle_oops(
     turn_key: str,
     captured_count: int = 0,
     last_image_hash: str | None = None,
+    toc_offset: int | None = None,
 ) -> bool:
     """Reopen the book through its reader and resume after the last verified capture."""
     log("[Kindle] Reopening the book to recover the reader...")
@@ -1007,6 +1067,19 @@ def recover_kindle_oops(
             if is_kindle_not_at_start(page):
                 rewind_kindle_to_start(page, turn_key)
             return _wait_for_kindle_reader(page)
+
+        if toc_offset is not None and last_image_hash is not None and last_kindle_page is not None:
+            log("[Kindle] Trying the table of contents to recover the page turn...")
+            try:
+                jumped = jump_to_kindle_chapter(page, toc_offset)
+            except Exception as exc:
+                log(f"[Kindle] Table of contents unavailable ({type(exc).__name__}).")
+                page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
+                if not _wait_for_kindle_reader(page):
+                    return False
+                jumped = False
+            if jumped and get_kindle_page_number(page) is None:
+                return False
 
         # When the footer is unavailable, start the search from the beginning.
         # A reopened book can restore a later position than the last capture.
@@ -1539,6 +1612,7 @@ def fetch_via_browser(
                             page, start_url, last_kindle_page, turn_key,
                             captured_count=page_idx - 1,
                             last_image_hash=last_kindle_image_hash,
+                            toc_offset={2: 1, 3: 0}.get(recovery_attempts),
                         )
                         if needs_recovery:
                             page.wait_for_timeout(1000)

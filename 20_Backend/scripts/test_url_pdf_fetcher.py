@@ -200,10 +200,16 @@ class UrlPdfFetcherTests(unittest.TestCase):
             <img id="page" width="200" height="260"><p id="position"></p>
             <button id="back" hidden>Back to Library</button>
             <button data-asin="TEST" hidden>Open book</button>
+            <button aria-label="Table of Contents" id="toc-toggle">☰</button>
+            <section hidden id="toc">
+              <h2>Table of Contents</h2>
+              <button data-page="23" aria-current="location">Chapter A</button>
+              <button data-page="27">Chapter B</button>
+            </section>
             <script>
               let current = 1;
               let objectURL;
-              let failedOnce = false;
+              let usedToc = false;
               const image = document.querySelector('#page');
               const position = document.querySelector('#position');
               const back = document.querySelector('#back');
@@ -233,12 +239,23 @@ class UrlPdfFetcherTests(unittest.TestCase):
                 current = 23;
                 render();
               };
+              const toc = document.querySelector('#toc');
+              document.querySelector('#toc-toggle').onclick = () => {
+                toc.hidden = !toc.hidden;
+              };
+              for (const chapter of toc.querySelectorAll('[data-page]')) {
+                chapter.onclick = () => {
+                  usedToc = true;
+                  current = Number(chapter.dataset.page);
+                  toc.hidden = true;
+                  render();
+                };
+              }
               document.addEventListener('keydown', (event) => {
                 if (!back.hidden || !book.hidden) return;
                 const next = current + (event.key === 'ArrowRight' ? 1 : -1);
                 if (next < 1 || next > 28) return;
                 if (FAIL_CONDITION) {
-                  failedOnce = true;
                   image.hidden = false; // The old page is still behind the dialog.
                   position.textContent = 'Oops... Something Went Wrong';
                   back.hidden = false;
@@ -276,14 +293,17 @@ class UrlPdfFetcherTests(unittest.TestCase):
             self.assertFalse(output.exists())
             self.assertEqual(len(checkpoint.load()), 24)
 
-            # Simulate pressing Re-download. A second transient error exercises
-            # automatic recovery after the saved pages have been reloaded.
+            # The next chapter opens at 27 but page turns into 26 only work
+            # after visiting it. Recovery must go back to the verified anchor.
             reader.write_text(
-                html.replace("FAIL_CONDITION", "next === 26 && !failedOnce"), encoding="utf-8"
+                html.replace("FAIL_CONDITION", "next === 26 && !usedToc"), encoding="utf-8"
             )
             args[args.index("--max-pages") + 1] = "28"
-            with patch.object(sys, "argv", args):
+            with patch.object(sys, "argv", args), patch.object(
+                fetcher, "jump_to_kindle_chapter", wraps=fetcher.jump_to_kindle_chapter
+            ) as jump:
                 self.assertEqual(fetcher.main(), 0)
+                self.assertEqual(jump.call_args.args[1], 1)
             status = json.loads(report.read_text(encoding="utf-8"))
 
         self.assertEqual((status["pageCount"], status["expectedPages"]), (28, 28))

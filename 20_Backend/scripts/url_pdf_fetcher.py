@@ -626,7 +626,7 @@ def is_kindle_oops(page) -> bool:
 
 
 def get_kindle_page_number(page) -> int | None:
-    """Extract current page number from Kindle Cloud Reader footer (e.g. 'Page 5 of 221')."""
+    """Extract current page or location number from Kindle Cloud Reader footer."""
     try:
         body_text = page.inner_text("body") or ""
         m = re.search(r"Page\s+(\d+)\s+of\s+\d+", body_text, re.IGNORECASE)
@@ -635,40 +635,85 @@ def get_kindle_page_number(page) -> int | None:
         m_ja = re.search(r"\d+\s*ページ中\s*(\d+)\s*ページ", body_text)
         if m_ja:
             return int(m_ja.group(1))
+        m_loc = re.search(r"Location\s+(\d+)\s+of\s+\d+", body_text, re.IGNORECASE)
+        if m_loc:
+            return int(m_loc.group(1))
+        m_loc_ja = re.search(r"位置\s*No\.?\s*(\d+)", body_text)
+        if m_loc_ja:
+            return int(m_loc_ja.group(1))
     except Exception:
         pass
     return None
 
 
-def recover_kindle_oops(page, start_url: str, last_kindle_page: int | None, turn_key: str) -> bool:
-    """Click 'Back to Library', reopen start_url, and step back to last_kindle_page + 1."""
+def _wait_for_kindle_reader(page, timeout_ms: int = 15000) -> bool:
+    """Wait until Kindle reader renders a blob page image or shows an Oops dialog."""
+    deadline = time.time() + (timeout_ms / 1000.0)
+    while time.time() < deadline:
+        dismiss_kindle_dialogs(page)
+        if is_kindle_oops(page):
+            return False
+        if _find_kindle_page_box(page) is not None:
+            return True
+        page.wait_for_timeout(500)
+    return _find_kindle_page_box(page) is not None and not is_kindle_oops(page)
+
+
+def recover_kindle_oops(
+    page,
+    start_url: str,
+    last_kindle_page: int | None,
+    turn_key: str,
+    captured_count: int = 0,
+) -> bool:
+    """Click 'Back to Library', reopen the book from library/URL, and resume at the next page."""
     log("[Kindle] Detected 'Oops... Something Went Wrong'. Recovering via Back to Library...")
     try:
         back_btn = page.locator("button:has-text('Back to Library'), a:has-text('Back to Library')").first
         if back_btn.count() > 0 and back_btn.is_visible():
             back_btn.click(timeout=3000)
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(3500)
     except Exception:
         pass
 
+    asin_match = re.search(r"[?&]asin=([A-Za-z0-9]+)", start_url)
+    asin = asin_match.group(1) if asin_match else None
+
     try:
-        page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(2500)
+        opened_from_library = False
+        if asin and "read.amazon" in (page.url or ""):
+            try:
+                card = page.locator(
+                    f"[data-asin='{asin}'], [id*='{asin}'], a[href*='{asin}']"
+                ).first
+                if card.count() > 0 and card.is_visible():
+                    card.click(timeout=5000)
+                    page.wait_for_timeout(3000)
+                    opened_from_library = True
+            except Exception:
+                pass
+
+        if not opened_from_library:
+            reopen_url = start_url
+            if asin:
+                parsed = urlparse(start_url)
+                reopen_url = f"{parsed.scheme}://{parsed.netloc}/?asin={asin}"
+            page.goto(reopen_url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(2500)
+
         wait_for_page_ready(page, timeout_ms=12000)
-        dismiss_kindle_dialogs(page)
-        if is_kindle_oops(page):
+        if not _wait_for_kindle_reader(page, timeout_ms=15000):
             return False
 
         if last_kindle_page is not None:
-            target_page = last_kindle_page + 1
             cur = get_kindle_page_number(page)
             steps = 0
-            max_steps = target_page + 15
-            while cur is not None and cur < target_page and steps < max_steps:
+            max_steps = max(captured_count + 20, 40)
+            while cur is not None and cur <= last_kindle_page and steps < max_steps:
                 steps += 1
                 prev_src = page.evaluate("() => document.querySelector('img[src^=\"blob:\"]')?.src || ''")
                 page.keyboard.press(turn_key)
-                page.wait_for_timeout(300)
+                page.wait_for_timeout(350)
                 try:
                     page.wait_for_function(
                         "(prev) => { const img = document.querySelector('img[src^=\"blob:\"]'); return img && img.complete && img.src !== prev; }",
@@ -678,7 +723,21 @@ def recover_kindle_oops(page, start_url: str, last_kindle_page: int | None, turn
                 except Exception:
                     pass
                 cur = get_kindle_page_number(page)
-            log(f"[Kindle] Resumed at page {cur} (target: {target_page}).")
+            log(f"[Kindle] Resumed at page/location {cur} (after {last_kindle_page}).")
+        elif captured_count > 0:
+            for _ in range(captured_count):
+                prev_src = page.evaluate("() => document.querySelector('img[src^=\"blob:\"]')?.src || ''")
+                page.keyboard.press(turn_key)
+                page.wait_for_timeout(350)
+                try:
+                    page.wait_for_function(
+                        "(prev) => { const img = document.querySelector('img[src^=\"blob:\"]'); return img && img.complete && img.src !== prev; }",
+                        arg=prev_src,
+                        timeout=2500,
+                    )
+                except Exception:
+                    pass
+            log(f"[Kindle] Stepped {captured_count} page(s) to resume position.")
 
         return _find_kindle_page_box(page) is not None and not is_kindle_oops(page)
     except Exception:
@@ -1136,12 +1195,18 @@ def fetch_via_browser(
                     dismiss_kindle_dialogs(page)
                     if is_kindle_oops(page):
                         recovered = False
-                        for attempt in range(2):
-                            log(f"[Kindle] Attempting recovery ({attempt + 1}/2)...")
-                            if recover_kindle_oops(page, start_url, last_kindle_page, turn_key):
+                        for attempt in range(3):
+                            log(f"[Kindle] Attempting recovery ({attempt + 1}/3)...")
+                            if recover_kindle_oops(
+                                page,
+                                start_url,
+                                last_kindle_page,
+                                turn_key,
+                                captured_count=len(collected_page_pdfs),
+                            ):
                                 recovered = True
                                 break
-                            page.wait_for_timeout(2000)
+                            page.wait_for_timeout(3000)
                         if not recovered:
                             if page_idx == 1:
                                 raise RuntimeError("Kindle でエラー画面 ('Oops... Something Went Wrong') が解消できませんでした。")

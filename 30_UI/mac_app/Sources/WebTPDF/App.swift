@@ -700,6 +700,7 @@ final class AppModel: ObservableObject {
         )
         urlFetchHistory.removeAll { $0.url == url && $0.direction == direction }
         urlFetchHistory.insert(entry, at: 0)
+        historyPageIndex = 0
         if urlFetchHistory.count > 100 {
             urlFetchHistory = Array(urlFetchHistory.prefix(100))
         }
@@ -868,6 +869,13 @@ final class AppModel: ObservableObject {
         progressText = "取得中"
         remainingText = "-"
         logText = "Fetching PDF from URL: \(urlString)\n"
+        recordURLFetchHistory(
+            url: urlString,
+            direction: pageTurnDirection,
+            outputURL: nil,
+            succeeded: false,
+            errorMessage: t("取得中...", "Fetching...")
+        )
         startProgressClock()
 
         preflightTask = Task { [weak self] in
@@ -905,6 +913,13 @@ final class AppModel: ObservableObject {
                 self.preflightTask = nil
                 self.isFetchingURL = false
                 if self.cancelRequested {
+                    self.recordURLFetchHistory(
+                        url: urlString,
+                        direction: self.pageTurnDirection,
+                        outputURL: nil,
+                        succeeded: false,
+                        errorMessage: self.t("キャンセル", "Canceled")
+                    )
                     self.finishCanceledPreflight()
                 } else {
                     self.recordURLFetchHistory(url: urlString, direction: self.pageTurnDirection, outputURL: nil, succeeded: false, errorMessage: error.localizedDescription)

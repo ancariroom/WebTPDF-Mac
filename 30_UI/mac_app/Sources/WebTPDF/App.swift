@@ -3265,24 +3265,6 @@ struct ContentView: View {
     private var dashboardView: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("WebTPDF Mac ダッシュボード")
-                        .font(.title2.bold())
-                    Text("WebページのPDF化とローカル音声変換の状況を一目で確認できます。")
-                        .foregroundStyle(.secondary)
-                }
-
-                HStack(spacing: 12) {
-                    topologyCard(model.t("PDFライブラリ", "PDF Library"), symbol: "doc.fill", detail: "\(model.libraryPDFs.count)")
-                    Image(systemName: "chevron.right").foregroundStyle(.secondary)
-                    topologyCard("音声エンジン", symbol: "waveform", detail: model.audioEngineMode.label)
-                    Image(systemName: "chevron.right").foregroundStyle(.secondary)
-                    topologyCard(model.t("AI接続", "AI Connection"), symbol: "brain", detail: "\(model.ollamaModels.count)件")
-                }
-                .padding(20)
-                .frame(maxWidth: .infinity)
-                .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 12))
-
                 HStack(spacing: 12) {
                     Button("URL → PDF 作成を開く") { destination = .urlToPDF }
                         .buttonStyle(.borderedProminent)

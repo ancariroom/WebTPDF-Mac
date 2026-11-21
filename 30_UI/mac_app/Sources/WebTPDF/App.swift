@@ -2580,7 +2580,7 @@ struct ContentView: View {
             }
         } detail: {
             Group {
-                switch destination ?? .urlToPDF {
+                switch destination ?? .dashboard {
                 case .runtime:
                     runtimeView
                 case .dashboard:
@@ -2601,7 +2601,12 @@ struct ContentView: View {
                     settingsView
                 }
             }
-            .navigationTitle((destination ?? .urlToPDF).title(model.uiLanguage))
+            .navigationTitle((destination ?? .dashboard).title(model.uiLanguage))
+            .onAppear {
+                if destination == nil {
+                    destination = .dashboard
+                }
+            }
             .toolbar {
                 ToolbarItemGroup {
                     Menu {

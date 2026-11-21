@@ -3250,6 +3250,11 @@ struct ContentView: View {
                         .buttonStyle(.borderedProminent)
                     Button("音声変換を開く") { destination = .audioLab }
                     Button(model.t("AI接続を開く", "Open AI Connection")) { destination = .models }
+                    Spacer()
+                    Button(model.t("アプリをアップデート", "Update App"), systemImage: "arrow.down.circle") {
+                        model.updateAndRelaunchApp()
+                    }
+                    .disabled(model.isRunning)
                 }
 
                 dashboardRuntimeBox

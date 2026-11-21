@@ -883,7 +883,7 @@ def check_kindle_completeness(
     max_pages: int,
 ) -> None:
     if expected_pages is not None:
-        incomplete = page_count < expected_pages or (last_page is not None and last_page < expected_pages)
+        incomplete = (last_page < expected_pages) if last_page is not None else (page_count < expected_pages)
     else:
         incomplete = last_percent is not None and last_percent < 95
     if incomplete:
@@ -941,6 +941,26 @@ class KindleCheckpoint:
                 return row if row is not None else (0, None)
         except sqlite3.Error:
             return 0, None
+
+    def verified_gaps(self) -> dict[int, bytes]:
+        with closing(sqlite3.connect(self.path)) as db:
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='verified_gaps'").fetchone() is None:
+                return {}
+            return dict(db.execute("SELECT ordinal, pdf FROM verified_gaps"))
+
+    def save_verified_gap(self, ordinal: int, pdf: bytes) -> None:
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("CREATE TABLE IF NOT EXISTS verified_gaps (ordinal INTEGER PRIMARY KEY, pdf BLOB NOT NULL)")
+            db.execute("INSERT INTO verified_gaps VALUES (?, ?)", (ordinal, pdf))
+
+    def final_path(self, proposed: Path) -> Path:
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("CREATE TABLE IF NOT EXISTS export_path (path TEXT NOT NULL)")
+            existing = db.execute("SELECT path FROM export_path").fetchone()
+            if existing:
+                return Path(existing[0])
+            db.execute("INSERT INTO export_path VALUES (?)", (str(proposed),))
+            return proposed
 
     def remove(self) -> None:
         self.path.unlink(missing_ok=True)
@@ -1722,6 +1742,186 @@ def resolve_auto_output_path(base_output: Path, title: str | None, pub_date: str
     return base_output
 
 
+def kindle_at_last_page(capture: KindleCapture) -> bool:
+    return capture.total is not None and capture.position == capture.total and capture.percent == 100
+
+
+def kindle_gap_candidates(captures: list[KindleCapture]) -> list[tuple[int, KindleCapture, KindleCapture]]:
+    return [
+        (ordinal, left, right)
+        for ordinal, (left, right) in enumerate(zip(captures, captures[1:]), 1)
+        if left.total is not None and left.total == right.total
+        and left.position is not None and right.position is not None
+        and right.position > left.position + 1
+    ]
+
+
+def kindle_frame_matches(page, saved: KindleCapture) -> bool:
+    if not saved.image_hash or get_kindle_position(page) != ("page", saved.position) or is_kindle_oops(page):
+        return False
+    box = _find_kindle_page_box(page)
+    if box is None:
+        return False
+    frame = page.screenshot(clip=box, timeout=5000)
+    return (
+        hashlib.sha256(frame).hexdigest() == saved.image_hash
+        or matches_saved_kindle_image(frame, saved.pdf)
+    )
+
+
+def verify_kindle_gap(page, left: KindleCapture, right: KindleCapture, turn_key: str) -> bytes | None:
+    """Verify both saved images and return the PDF pages from the views between them."""
+    if not left.image_hash or not right.image_hash or left.position is None or right.position is None:
+        return None
+    reverse_key = "ArrowRight" if turn_key == "ArrowLeft" else "ArrowLeft"
+    position = get_kindle_position(page)
+    if position is None or position[0] != "page" or abs(position[1] - left.position) > 5:
+        seek_kindle_position(page, left.position, True, left.total)
+
+    step = None
+    for _ in range(9):
+        if kindle_frame_matches(page, left):
+            break
+        position = get_kindle_position(page)
+        if position is None or position[0] != "page" or position[1] == left.position:
+            return None
+        direction = reverse_key if position[1] > left.position else turn_key
+        if step is not None and step != direction:
+            return None
+        step = direction
+        source = page.evaluate(KINDLE_PAGE_SOURCE)
+        page.keyboard.press(direction)
+        if not wait_for_kindle_turn(page, source):
+            return None
+        page.wait_for_timeout(200)
+    else:
+        return None
+
+    writer = PdfWriter()
+    previous = left.position
+    for _ in range(min(40, right.position - left.position + 4)):
+        source = page.evaluate(KINDLE_PAGE_SOURCE)
+        page.keyboard.press(turn_key)
+        if not wait_for_kindle_turn(page, source):
+            return None
+        page.wait_for_timeout(200)
+        if kindle_frame_matches(page, right):
+            if not writer.pages:
+                return b""
+            buffer = io.BytesIO()
+            writer.write(buffer)
+            return buffer.getvalue()
+        marker = get_kindle_position(page)
+        if not marker or marker[0] != "page" or not previous < marker[1] < right.position:
+            return None
+        screenshot = capture_kindle_page_as_pdf_bytes(page)
+        if screenshot is None or is_kindle_oops(page):
+            return None
+        writer.append(io.BytesIO(screenshot[0]))
+        previous = marker[1]
+    return None
+
+
+def verify_merged_kindle_pdf(pdfs: list[bytes], output: Path, count: int) -> None:
+    """Open the merged PDF independently and compare every page in order."""
+    import pymupdf
+
+    def fingerprint(doc, page) -> bytes:
+        digests = [
+            hashlib.sha256(doc.extract_image(item[0])["image"]).digest()
+            for item in page.get_images()
+        ]
+        return hashlib.sha256(
+            repr(tuple(page.rect)).encode() + page.read_contents()
+            + page.get_text().encode() + b"".join(digests)
+        ).digest()
+
+    with pymupdf.open(output) as merged:
+        if len(merged) != count:
+            raise RuntimeError("PDFの最終確認でページ数が一致しませんでした。")
+        ordinal = 0
+        for blob in pdfs:
+            with pymupdf.open(stream=blob, filetype="pdf") as original:
+                for page in original:
+                    if ordinal >= len(merged) or fingerprint(original, page) != fingerprint(merged, merged[ordinal]):
+                        raise RuntimeError(f"PDFの最終確認で {ordinal + 1} ページ目が一致しませんでした。")
+                    ordinal += 1
+        if ordinal != len(merged):
+            raise RuntimeError("PDFの最終確認でページ数が一致しませんでした。")
+    log(f"[Verify] Final PDF reopened and all {count} pages matched the saved order.")
+
+
+def finish_kindle_at_end(
+    start_url: str, proposed_output: Path, turn_key: str,
+    checkpoint: KindleCheckpoint, captures: list[KindleCapture],
+    result_details: dict[str, int] | None,
+) -> tuple[int, Path]:
+    """Check potential gaps within the saved sequence and publish a single PDF."""
+    gaps = kindle_gap_candidates(captures)
+    verified = checkpoint.verified_gaps()
+    todo = [(i, left, right) for i, left, right in gaps if i not in verified]
+    output = checkpoint.final_path(proposed_output)
+    if todo:
+        log(f"[Kindle] Last page reached. Checking {len(todo)} intervals for missing views.")
+        try:
+            from playwright.sync_api import sync_playwright
+
+            endpoint = resolve_cdp_url()
+            if endpoint is None:
+                raise RuntimeError("The Kindle browser session is not available")
+            with sync_playwright() as p:
+                browser = p.chromium.connect_over_cdp(endpoint)
+                page = browser.contexts[0].new_page()
+                try:
+                    page.set_viewport_size({"width": 800, "height": captures[-1].viewport_height or 1140})
+                    page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
+                    if not _wait_for_kindle_reader(page):
+                        raise RuntimeError("The book did not reopen")
+                    for index, (ordinal, left, right) in enumerate(todo, 1):
+                        log(f"[Kindle] Checking interval {index}/{len(todo)} (Kindle {left.position}–{right.position}).")
+                        try:
+                            repaired = verify_kindle_gap(page, left, right, turn_key)
+                        except Exception as exc:
+                            log(f"[Kindle] Interval {left.position}–{right.position}: {type(exc).__name__}")
+                            repaired = None
+                        if repaired is None:
+                            if is_kindle_oops(page):
+                                page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
+                                if not _wait_for_kindle_reader(page):
+                                    break
+                        else:
+                            checkpoint.save_verified_gap(ordinal, repaired)
+                            verified[ordinal] = repaired
+                finally:
+                    page.close()
+        except Exception as exc:
+            log(f"[Kindle] Some intervals could not be checked: {exc}")
+
+    pdfs = []
+    for ordinal, capture in enumerate(captures, 1):
+        pdfs.append(capture.pdf)
+        if verified.get(ordinal):
+            pdfs.append(verified[ordinal])
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=output.parent) as folder:
+        staged = Path(folder) / output.name
+        written = merge_pdf_bytes_list(pdfs, staged)
+        verify_merged_kindle_pdf(pdfs, staged, written)
+        staged.replace(output)
+    unchecked = sum(ordinal not in verified for ordinal, _, _ in gaps)
+    log(f"[Kindle] Finalized {written} PDF pages; {unchecked} intervals could not be verified.")
+    if result_details is not None:
+        result_details.update({
+            "expectedPages": captures[-1].total,
+            "lastPrintedPage": captures[-1].position,
+            "unverifiedGaps": unchecked,
+            "verifiedPages": written,
+        })
+    if unchecked == 0:
+        checkpoint.remove()
+    return written, output
+
+
 def fetch_via_browser(
     start_url: str,
     output_path: Path,
@@ -1733,6 +1933,11 @@ def fetch_via_browser(
     result_details: dict[str, int] | None = None,
 ) -> tuple[int, Path]:
     """Use CDP (logged-in Chrome) or headless Chromium to paginate with ArrowRight/ArrowLeft and capture PDFs."""
+    turn_key = "ArrowLeft" if direction == "left" else "ArrowRight"
+    saved_captures = kindle_checkpoint.load() if kindle_checkpoint and kindle_checkpoint.path.exists() else []
+    if saved_captures and kindle_at_last_page(saved_captures[-1]):
+        return finish_kindle_at_end(start_url, output_path, turn_key, kindle_checkpoint, saved_captures, result_details)
+
     from playwright.sync_api import sync_playwright
 
     captured_pdfs: list[bytes] = []
@@ -1811,7 +2016,7 @@ def fetch_via_browser(
                 if resolved_output != output_path:
                     log(f"[AutoName] Output filename -> {resolved_output.name}")
             book_title = detected_title if kindle_mode else None
-            saved_pages = kindle_checkpoint.load() if kindle_mode and kindle_checkpoint else []
+            saved_pages = saved_captures if kindle_mode else []
             if saved_pages:
                 log(f"[Kindle] Loaded {len(saved_pages)} saved page(s); resuming capture.")
                 if saved_pages[-1].viewport_height is not None:
@@ -1843,7 +2048,6 @@ def fetch_via_browser(
                     return merge_pdf_bytes_list(blobs, resolved_output), resolved_output
 
             # 3. Paginate with ArrowRight / ArrowLeft and capture each page via PDF command
-            turn_key = "ArrowLeft" if direction == "left" else "ArrowRight"
             if direction == "left":
                 arrow_button_selectors = [
                     "#kr-chevron-left:not([disabled])",
@@ -1896,6 +2100,8 @@ def fetch_via_browser(
                 if kindle_mode:
                     dismiss_kindle_dialogs(page)
                     if needs_recovery or is_kindle_oops(page):
+                        if last_kindle_page is not None and last_kindle_page == expected_total_pages and last_kindle_percent == 100:
+                            break
                         if recovery_attempts >= 4:
                             raise IncompleteKindleCapture(
                                 f"Kindleのエラーから復旧できませんでした（取得済み: {page_idx - 1} ページ）。",
@@ -2132,11 +2338,14 @@ def fetch_via_browser(
                 prev_pdf_hash = current_pdf_hash
                 if kindle_mode:
                     last_kindle_image_hash = hashlib.sha256(kindle_png).hexdigest() if kindle_png is not None else None
-                    last_kindle_page = get_kindle_page_number(page)
+                    marker = get_kindle_position(page)
                     recovery_attempts = 0
                     k_total = get_kindle_total_pages(page)
                     if k_total is not None:
                         expected_total_pages = k_total
+                    last_kindle_page = marker[1] if marker and (
+                        marker[0] == "page" or expected_total_pages is None
+                    ) else None
                     k_pct = get_kindle_progress_percent(page)
                     if k_pct is not None:
                         last_kindle_percent = k_pct
@@ -2187,6 +2396,9 @@ def fetch_via_browser(
             if not kindle_mode and captured_pdfs and len(captured_pdfs) >= len(collected_page_pdfs):
                 written = merge_pdf_bytes_list(captured_pdfs, resolved_output)
             elif kindle_mode and kindle_checkpoint is not None:
+                captures = kindle_checkpoint.load()
+                if captures and kindle_at_last_page(captures[-1]):
+                    return finish_kindle_at_end(start_url, resolved_output, turn_key, kindle_checkpoint, captures, result_details)
                 resolved_output.parent.mkdir(parents=True, exist_ok=True)
                 with tempfile.TemporaryDirectory(dir=resolved_output.parent) as folder:
                     staged_output = Path(folder) / resolved_output.name
@@ -2194,13 +2406,16 @@ def fetch_via_browser(
                     check_kindle_completeness(
                         written, expected_total_pages, last_kindle_page, last_kindle_percent, max_pages,
                     )
+                    verify_merged_kindle_pdf(collected_page_pdfs, staged_output, written)
                     staged_output.replace(resolved_output)
+                    if result_details is not None:
+                        result_details["verifiedPages"] = written
             else:
                 written = merge_pdf_bytes_list(collected_page_pdfs, resolved_output)
             try:
                 qc = verify_exported_pdf(
                     resolved_output,
-                    expected_pages=expected_total_pages,
+                    expected_pages=expected_total_pages if last_kindle_page != expected_total_pages else None,
                     last_percent=last_kindle_percent,
                 )
                 log(f"[Verify] {qc['summary']}")
@@ -2211,6 +2426,9 @@ def fetch_via_browser(
                 kindle_checkpoint.remove()
             if result_details is not None and expected_total_pages is not None:
                 result_details["expectedPages"] = expected_total_pages
+                if last_kindle_page == expected_total_pages:
+                    result_details["lastPrintedPage"] = last_kindle_page
+                    result_details["unverifiedGaps"] = 0
             return written, resolved_output
         finally:
             if created_page:

@@ -322,6 +322,110 @@ class UrlPdfFetcherTests(unittest.TestCase):
                 pixels = page.get_pixmap()
                 self.assertAlmostEqual(pixels.pixel(pixels.width // 2, pixels.height // 2)[0], number * 8, delta=3)
 
+    def test_kindle_gap_only_inserts_views_between_matched_anchors(self) -> None:
+        import hashlib
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.set_content("""
+                    <img width="180" height="210"><p></p>
+                    <script>
+                      const img = document.querySelector('img');
+                      let pageNumber = 1;
+                      window.skipMiddle = false;
+                      window.render = (n) => {
+                        pageNumber = n;
+                        const canvas = document.createElement('canvas');
+                        canvas.width = 180;
+                        canvas.height = 210;
+                        const ctx = canvas.getContext('2d');
+                        ctx.fillStyle = 'rgb(' + n * 60 + ',60,120)';
+                        ctx.fillRect(0, 0, 180, 210);
+                        canvas.toBlob((blob) => {
+                          img.src = URL.createObjectURL(blob);
+                          document.querySelector('p').textContent = 'Page ' + n + ' of 3';
+                        });
+                      };
+                      window.addEventListener("keydown", (event) => {
+                        if (event.key === 'ArrowRight' && pageNumber < 3)
+                          render(window.skipMiddle ? 3 : pageNumber + 1);
+                      });
+                      render(1);
+                    </script>
+                """)
+
+                def ready() -> None:
+                    page.wait_for_function("() => document.querySelector('img').complete && document.querySelector('img').naturalWidth")
+
+                def saved(number: int):
+                    page.evaluate("(n) => render(n)", number)
+                    page.get_by_text(f"Page {number} of 3", exact=True).wait_for()
+                    ready()
+                    pdf, png = fetcher.capture_kindle_page_as_pdf_bytes(page)
+                    return fetcher.KindleCapture(pdf, number, hashlib.sha256(png).hexdigest(), 3, None, None)
+
+                left, right = saved(1), saved(3)
+                saved(1)
+                repaired = fetcher.verify_kindle_gap(page, left, right, "ArrowRight")
+                self.assertIsNotNone(repaired)
+                self.assertEqual(len(PdfReader(io.BytesIO(repaired)).pages), 1)
+                page.evaluate("window.skipMiddle = true")
+                saved(1)
+                self.assertEqual(fetcher.verify_kindle_gap(page, left, right, "ArrowRight"), b"")
+            finally:
+                browser.close()
+
+    def test_kindle_end_finalizes_saved_pdf_and_checks_repaired_order(self) -> None:
+        from PIL import Image
+        import fitz
+
+        def tile(value: int) -> bytes:
+            output = io.BytesIO()
+            Image.new("RGB", (100, 120), (value, 20, 40)).save(output, "PDF")
+            return output.getvalue()
+
+        checkpoint = fetcher.KindleCheckpoint(self.root / "finished.sqlite3")
+        source = [tile(value) for value in (40, 120, 160)]
+        for ordinal, (position, pdf) in enumerate(zip((1, 3, 4), source), 1):
+            checkpoint.append(ordinal, fetcher.KindleCapture(
+                pdf, position, "fixture", 4, 100 if position == 4 else 0, 1114,
+            ))
+        url = "https://read.amazon.co.jp/?asin=TEST"
+        output = self.root / "merged.pdf"
+        details = {}
+        with patch.object(fetcher, "resolve_cdp_url", return_value=None):
+            count, path = fetcher.fetch_via_browser(
+                url, output, 100, 10, kindle_checkpoint=checkpoint, result_details=details,
+            )
+        self.assertEqual((count, path), (3, output))
+        self.assertEqual(details, {
+            "expectedPages": 4, "lastPrintedPage": 4, "unverifiedGaps": 1, "verifiedPages": 3,
+        })
+        self.assertTrue(checkpoint.path.exists())
+
+        # A verified gap can be saved between attempts. The same output file
+        # is updated when all intervals have been checked.
+        inserted = tile(80)
+        checkpoint.save_verified_gap(1, inserted)
+        second_output = self.root / "another-name.pdf"
+        count, path = fetcher.fetch_via_browser(
+            url, second_output, 100, 10, kindle_checkpoint=checkpoint, result_details=details,
+        )
+        self.assertEqual((count, path), (4, output))
+        self.assertEqual(details["unverifiedGaps"], 0)
+        self.assertEqual(details["verifiedPages"], 4)
+        self.assertFalse(checkpoint.path.exists())
+        self.assertFalse(second_output.exists())
+        with fitz.open(output) as final:
+            for value, page in zip((40, 80, 120, 160), final):
+                pixels = page.get_pixmap()
+                self.assertAlmostEqual(pixels.pixel(pixels.width // 2, pixels.height // 2)[0], value, delta=3)
+        with self.assertRaisesRegex(RuntimeError, "1 ページ目"):
+            fetcher.verify_merged_kindle_pdf([inserted, *source], output, 4)
+
     def test_kindle_go_to_location_uses_the_rendered_page_to_seek(self) -> None:
         from playwright.sync_api import sync_playwright
 

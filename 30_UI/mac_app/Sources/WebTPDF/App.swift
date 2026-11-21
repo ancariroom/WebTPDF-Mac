@@ -157,6 +157,9 @@ final class AppModel: ObservableObject {
         let errorMessage: String?
         var pageCount: Int?
         var expectedPages: Int?
+        let lastPrintedPage: Int?
+        let unverifiedGaps: Int?
+        let verifiedPages: Int?
 
         var isKindle: Bool {
             URL(string: url)?.host?.lowercased().hasPrefix("read.amazon.") == true
@@ -164,6 +167,7 @@ final class AppModel: ObservableObject {
 
         var hasWarning: Bool {
             guard succeeded else { return true }
+            if let unverifiedGaps { return unverifiedGaps > 0 }
             guard let pageCount, let expectedPages else { return false }
             return pageCount < expectedPages
         }
@@ -177,6 +181,9 @@ final class AppModel: ObservableObject {
         let outputPath: String?
         let pageCount: Int
         let expectedPages: Int?
+        let lastPrintedPage: Int?
+        let unverifiedGaps: Int?
+        let verifiedPages: Int?
         let message: String?
     }
 
@@ -734,7 +741,10 @@ final class AppModel: ObservableObject {
         succeeded: Bool,
         errorMessage: String? = nil,
         pageCount: Int? = nil,
-        expectedPages: Int? = nil
+        expectedPages: Int? = nil,
+        lastPrintedPage: Int? = nil,
+        unverifiedGaps: Int? = nil,
+        verifiedPages: Int? = nil
     ) {
         let entry = URLFetchHistoryItem(
             id: UUID(),
@@ -745,7 +755,10 @@ final class AppModel: ObservableObject {
             succeeded: succeeded,
             errorMessage: errorMessage,
             pageCount: pageCount,
-            expectedPages: expectedPages
+            expectedPages: expectedPages,
+            lastPrintedPage: lastPrintedPage,
+            unverifiedGaps: unverifiedGaps,
+            verifiedPages: verifiedPages
         )
         urlFetchHistory.removeAll { $0.url == url && $0.direction == direction }
         urlFetchHistory.insert(entry, at: 0)
@@ -844,6 +857,13 @@ final class AppModel: ObservableObject {
             return itemURL.standardizedFileURL.path == targetPath
                 || itemURL.lastPathComponent == pdfURL.lastPathComponent
         }
+    }
+
+    func activeHistoryQueueStatus(_ entry: URLFetchHistoryItem) -> PDFQueueItem.Status? {
+        pdfQueue.first {
+            $0.url == entry.url && $0.direction == entry.direction
+                && ($0.status == .pending || $0.status == .running)
+        }?.status
     }
 
     func redownloadFromHistory(_ item: URLFetchHistoryItem) {
@@ -956,7 +976,7 @@ final class AppModel: ObservableObject {
                     self.fetchedPDFURL = mergedURL
                     self.fetchedFromSourceURL = item.url
                     self.outputDirectory = mergedURL.deletingLastPathComponent()
-                    self.recordURLFetchHistory(url: item.url, direction: item.direction, outputURL: mergedURL, succeeded: true, pageCount: result.pageCount, expectedPages: result.expectedPages)
+                    self.recordURLFetchHistory(url: item.url, direction: item.direction, outputURL: mergedURL, succeeded: true, pageCount: result.pageCount, expectedPages: result.expectedPages, lastPrintedPage: result.lastPrintedPage, unverifiedGaps: result.unverifiedGaps, verifiedPages: result.verifiedPages)
                     self.appendLog("[Queue #\(processedCount)] Saved -> \(mergedURL.path)\n")
                 case let .failure(error):
                     if !self.cancelRequested { failedCount += 1 }
@@ -1044,7 +1064,7 @@ final class AppModel: ObservableObject {
                 self.progressText = "100%"
                 self.remainingText = "00:00"
                 self.refreshLibraryPDFs()
-                self.recordURLFetchHistory(url: urlString, direction: direction, outputURL: mergedURL, succeeded: true, pageCount: result.pageCount, expectedPages: result.expectedPages)
+                self.recordURLFetchHistory(url: urlString, direction: direction, outputURL: mergedURL, succeeded: true, pageCount: result.pageCount, expectedPages: result.expectedPages, lastPrintedPage: result.lastPrintedPage, unverifiedGaps: result.unverifiedGaps, verifiedPages: result.verifiedPages)
                 self.appendLog("\nMerged PDF saved to: \(mergedURL.path)\n")
                 self.sendCompletionNotification(
                     title: self.t("PDF作成完了", "PDF Created"),
@@ -3082,10 +3102,18 @@ struct ContentView: View {
                 } else {
                     ForEach(Array(pageEntries.enumerated()), id: \.element.id) { idx, entry in
                         HStack(spacing: 10) {
-                            let isFetchingEntry = !entry.succeeded && (entry.errorMessage == "取得中..." || entry.errorMessage == "Fetching...")
+                            let queueStatus = model.activeHistoryQueueStatus(entry)
+                            let isFetchingEntry = queueStatus == .running || (
+                                model.isFetchingURL && !entry.succeeded
+                                && (entry.errorMessage == "取得中..." || entry.errorMessage == "Fetching...")
+                            )
                             if isFetchingEntry {
                                 ProgressView()
                                     .controlSize(.small)
+                                    .accessibilityLabel(model.t("取得中", "Fetching"))
+                            } else if queueStatus == .pending {
+                                Image(systemName: "clock")
+                                    .accessibilityLabel(model.t("待機中", "Queued"))
                             } else {
                                 Image(systemName: entry.hasWarning ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
                                     .foregroundStyle(entry.hasWarning ? Color.orange : Color.green)
@@ -3099,10 +3127,15 @@ struct ContentView: View {
                                 HStack(spacing: 8) {
                                     Text(entry.direction.label)
                                     if let count = entry.pageCount {
-                                        let pages = entry.expectedPages.map { "\(count)/\($0)" }
-                                            ?? (entry.isKindle ? model.t("\(count)/不明", "\(count)/unknown") : "\(count)")
-                                        Text(model.t("\(pages) ページ", "\(pages) pages"))
-                                            .monospacedDigit()
+                                        if let last = entry.lastPrintedPage, let total = entry.expectedPages {
+                                            Text(model.t("PDF \(count)枚・Kindle \(last)/\(total)", "PDF \(count) pages · Kindle \(last)/\(total)"))
+                                                .monospacedDigit()
+                                        } else {
+                                            let pages = entry.expectedPages.map { "\(count)/\($0)" }
+                                                ?? (entry.isKindle ? model.t("\(count)/不明", "\(count)/unknown") : "\(count)")
+                                            Text(model.t("\(pages) ページ", "\(pages) pages"))
+                                                .monospacedDigit()
+                                        }
                                     }
                                     if let path = entry.outputPath {
                                         Text(URL(fileURLWithPath: path).lastPathComponent)
@@ -3117,6 +3150,22 @@ struct ContentView: View {
                                 }
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
+                                if let verified = entry.verifiedPages {
+                                    Text(model.t(
+                                        "PDF最終確認済み \(verified)枚",
+                                        "Final PDF verified · \(verified) pages"
+                                    ))
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                }
+                                if let gaps = entry.unverifiedGaps, gaps > 0 {
+                                    Text(model.t(
+                                        "最終ページ到達・未確認 \(gaps) 区間",
+                                        "Last page reached · \(gaps) unchecked intervals"
+                                    ))
+                                    .font(.caption2)
+                                    .foregroundStyle(.orange)
+                                }
                                 if entry.isKindle && entry.expectedPages == nil && entry.pageCount != nil {
                                     if let notice = model.historyPageCountMessages[entry.id] {
                                         Text(notice)
@@ -3146,10 +3195,21 @@ struct ContentView: View {
                                 }
                             }
 
-                            Button(model.t("再ダウンロード", "Re-download")) {
+                            let retryButton = Button(
+                                isFetchingEntry ? model.t("取得中…", "Fetching…")
+                                : queueStatus == .pending ? model.t("待機中", "Queued")
+                                : model.t("再ダウンロード", "Re-download")
+                            ) {
                                 model.redownloadFromHistory(entry)
                             }
-                            .buttonStyle(.bordered)
+                            .disabled(isFetchingEntry || queueStatus != nil)
+                            if entry.hasWarning && !isFetchingEntry && queueStatus == nil {
+                                retryButton
+                                    .buttonStyle(.borderedProminent)
+                                    .tint(.orange)
+                            } else {
+                                retryButton.buttonStyle(.bordered)
+                            }
 
                             Button {
                                 model.removeURLFetchHistoryItem(entry.id)

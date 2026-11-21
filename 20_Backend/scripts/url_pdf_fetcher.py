@@ -1896,7 +1896,9 @@ def finish_kindle_at_end(
     gaps = kindle_gap_candidates(captures)
     verified = checkpoint.verified_gaps()
     todo = [(i, left, right) for i, left, right in gaps if i not in verified]
+    unchecked = len(todo)
     output = checkpoint.final_path(proposed_output)
+    log(f"KINDLE_UNVERIFIED_GAPS={unchecked}")
     if todo:
         log(f"[Kindle] Last page reached. Checking {len(todo)} intervals for missing views.")
         try:
@@ -1929,6 +1931,8 @@ def finish_kindle_at_end(
                         else:
                             checkpoint.save_verified_gap(ordinal, repaired)
                             verified[ordinal] = repaired
+                            unchecked -= 1
+                            log(f"KINDLE_UNVERIFIED_GAPS={unchecked}")
                 finally:
                     page.close()
         except Exception as exc:
@@ -1945,7 +1949,6 @@ def finish_kindle_at_end(
         written = merge_pdf_bytes_list(pdfs, staged)
         verify_merged_kindle_pdf(pdfs, staged, written)
         staged.replace(output)
-    unchecked = sum(ordinal not in verified for ordinal, _, _ in gaps)
     log(f"[Kindle] Finalized {written} PDF pages; {unchecked} intervals could not be verified.")
     if result_details is not None:
         result_details.update({

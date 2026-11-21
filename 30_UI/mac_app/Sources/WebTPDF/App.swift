@@ -177,6 +177,12 @@ final class AppModel: ObservableObject {
         let expectedPages: Int
     }
 
+    private struct KindleVerificationProgress {
+        let url: String
+        let direction: PageTurnDirection
+        let unchecked: Int
+    }
+
     private struct URLFetchResult: Decodable, Sendable {
         let outputPath: String?
         let pageCount: Int
@@ -274,6 +280,7 @@ final class AppModel: ObservableObject {
         return decoded
     }()
     @Published private(set) var checkingHistoryPageCount: UUID?
+    @Published private var kindleVerificationProgress: KindleVerificationProgress?
     @Published private(set) var historyPageCountMessages: [UUID: String] = [:]
     @Published var historyPageIndex: Int = 0
     @Published var isUpdatingApp: Bool = false
@@ -365,6 +372,7 @@ final class AppModel: ObservableObject {
 
     private var process: Process?
     private var fetchProcess: Process?
+    private var fetchOutputRemainder = Data()
     private var player: AVPlayer?
     private var activeOutputDirectory: URL?
     private var activeDryRun = false
@@ -864,6 +872,12 @@ final class AppModel: ObservableObject {
             $0.url == entry.url && $0.direction == entry.direction
                 && ($0.status == .pending || $0.status == .running)
         }?.status
+    }
+
+    func remainingKindleIntervals(for entry: URLFetchHistoryItem) -> Int? {
+        guard let progress = kindleVerificationProgress,
+              progress.url == entry.url, progress.direction == entry.direction else { return nil }
+        return progress.unchecked
     }
 
     func redownloadFromHistory(_ item: URLFetchHistoryItem) {
@@ -2178,19 +2192,23 @@ final class AppModel: ObservableObject {
             let pipe = Pipe()
             proc.standardOutput = pipe
             proc.standardError = pipe
-            pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            pipe.fileHandleForReading.readabilityHandler = { [weak self, weak proc] handle in
                 let data = handle.availableData
-                guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else {
-                    return
-                }
-                Task { @MainActor in
-                    self?.appendLog(chunk)
+                guard !data.isEmpty else { return }
+                DispatchQueue.main.async {
+                    guard let self, let proc, self.fetchProcess === proc else { return }
+                    self.appendURLFetchOutput(data, url: urlString, direction: resolvedDirection)
                 }
             }
 
             proc.terminationHandler = { [weak self] terminated in
                 pipe.fileHandleForReading.readabilityHandler = nil
-                Task { @MainActor in
+                DispatchQueue.main.async {
+                    if let self, !self.fetchOutputRemainder.isEmpty {
+                        self.appendLog(String(decoding: self.fetchOutputRemainder, as: UTF8.self))
+                    }
+                    self?.fetchOutputRemainder = Data()
+                    self?.kindleVerificationProgress = nil
                     self?.fetchProcess = nil
                     let result = (try? Data(contentsOf: resultURL)).flatMap {
                         try? JSONDecoder().decode(URLFetchResult.self, from: $0)
@@ -2231,6 +2249,24 @@ final class AppModel: ObservableObject {
                 continuation.resume(throwing: UserVisibleError(message: "PDF取得プロセスの起動に失敗しました: \(error.localizedDescription)"))
             }
         }
+    }
+
+    private func appendURLFetchOutput(_ data: Data, url: String, direction: PageTurnDirection) {
+        fetchOutputRemainder.append(data)
+        guard let end = fetchOutputRemainder.lastIndex(of: 10) else { return }
+        let output = String(decoding: fetchOutputRemainder[...end], as: UTF8.self)
+        fetchOutputRemainder = Data(fetchOutputRemainder[fetchOutputRemainder.index(after: end)...])
+
+        let prefix = "KINDLE_UNVERIFIED_GAPS="
+        var log = ""
+        for line in output.split(separator: "\n", omittingEmptySubsequences: false).dropLast() {
+            if line.hasPrefix(prefix), let count = Int(line.dropFirst(prefix.count)), count >= 0 {
+                kindleVerificationProgress = KindleVerificationProgress(url: url, direction: direction, unchecked: count)
+            } else {
+                log += line + "\n"
+            }
+        }
+        if !log.isEmpty { appendLog(log) }
     }
 
     private func waitForDockerReady(dockerCommand: String) async -> Bool {
@@ -3158,7 +3194,14 @@ struct ContentView: View {
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)
                                 }
-                                if let gaps = entry.unverifiedGaps, gaps > 0 {
+                                if isFetchingEntry, let gaps = model.remainingKindleIntervals(for: entry) {
+                                    Text(gaps == 0
+                                         ? model.t("未確認 0 区間・PDF最終確認中…", "0 unchecked intervals · Final PDF verification…")
+                                         : model.t("未確認 \(gaps) 区間・確認中…", "\(gaps) unchecked intervals · Checking…"))
+                                        .font(.caption2)
+                                        .monospacedDigit()
+                                        .foregroundStyle(gaps > 0 ? Color.orange : Color.secondary)
+                                } else if let gaps = entry.unverifiedGaps, gaps > 0 {
                                     Text(model.t(
                                         "最終ページ到達・未確認 \(gaps) 区間",
                                         "Last page reached · \(gaps) unchecked intervals"

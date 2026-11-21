@@ -396,24 +396,39 @@ class UrlPdfFetcherTests(unittest.TestCase):
         url = "https://read.amazon.co.jp/?asin=TEST"
         output = self.root / "merged.pdf"
         details = {}
-        with patch.object(fetcher, "resolve_cdp_url", return_value=None):
+        with (
+            patch.object(fetcher, "resolve_cdp_url", return_value=None),
+            patch.object(fetcher, "log") as log,
+        ):
             count, path = fetcher.fetch_via_browser(
                 url, output, 100, 10, kindle_checkpoint=checkpoint, result_details=details,
             )
+        self.assertEqual([message for (message,), _ in log.call_args_list
+                          if message.startswith("KINDLE_UNVERIFIED_GAPS=")],
+                         ["KINDLE_UNVERIFIED_GAPS=1"])
         self.assertEqual((count, path), (3, output))
         self.assertEqual(details, {
             "expectedPages": 4, "lastPrintedPage": 4, "unverifiedGaps": 1, "verifiedPages": 3,
         })
         self.assertTrue(checkpoint.path.exists())
 
-        # A verified gap can be saved between attempts. The same output file
-        # is updated when all intervals have been checked.
+        # A successful retry publishes the updated count and replaces the PDF
+        # at the same path after verifying its pages.
         inserted = tile(80)
-        checkpoint.save_verified_gap(1, inserted)
         second_output = self.root / "another-name.pdf"
-        count, path = fetcher.fetch_via_browser(
-            url, second_output, 100, 10, kindle_checkpoint=checkpoint, result_details=details,
-        )
+        with (
+            patch("playwright.sync_api.sync_playwright"),
+            patch.object(fetcher, "resolve_cdp_url", return_value="http://localhost"),
+            patch.object(fetcher, "_wait_for_kindle_reader", return_value=True),
+            patch.object(fetcher, "verify_kindle_gap", return_value=inserted),
+            patch.object(fetcher, "log") as log,
+        ):
+            count, path = fetcher.fetch_via_browser(
+                url, second_output, 100, 10, kindle_checkpoint=checkpoint, result_details=details,
+            )
+        self.assertEqual([message for (message,), _ in log.call_args_list
+                          if message.startswith("KINDLE_UNVERIFIED_GAPS=")],
+                         ["KINDLE_UNVERIFIED_GAPS=1", "KINDLE_UNVERIFIED_GAPS=0"])
         self.assertEqual((count, path), (4, output))
         self.assertEqual(details["unverifiedGaps"], 0)
         self.assertEqual(details["verifiedPages"], 4)

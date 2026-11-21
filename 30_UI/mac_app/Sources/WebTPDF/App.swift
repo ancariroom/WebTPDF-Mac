@@ -2629,11 +2629,11 @@ struct ContentView: View {
         VisibleScrollView {
             VStack(alignment: .leading, spacing: 24) {
 
-                HStack(spacing: 12) {
+                HStack(spacing: 10) {
                     Button {
                         isSourceURLFocused = true
                     } label: {
-                        topologyCard(model.t("ソースURL", "Source URL"), symbol: "globe", detail: model.trimmedSourceURL.isEmpty ? model.t("未入力", "Empty") : model.t("入力済み", "Ready"))
+                        topologyCard(model.t("① ソースURL", "① Source URL"), symbol: "globe", detail: model.trimmedSourceURL.isEmpty ? model.t("未入力", "Empty") : model.t("入力済み", "Ready"))
                     }
                     .buttonStyle(.plain)
                     .help(model.t("クリックしてURL入力欄にカーソルを移動", "Click to focus URL input"))
@@ -2643,19 +2643,38 @@ struct ContentView: View {
                     Button {
                         model.pageTurnDirection = model.pageTurnDirection == .left ? .right : .left
                     } label: {
-                        topologyCard(model.t("ページ送り", "Pagination"), symbol: model.pageTurnDirection == .left ? "arrow.left.square" : "arrow.right.square", detail: model.pageTurnDirection.label)
+                        topologyCard(model.t("② ページ送り", "② Pagination"), symbol: model.pageTurnDirection == .left ? "arrow.left.square" : "arrow.right.square", detail: model.pageTurnDirection.label)
                     }
                     .buttonStyle(.plain)
                     .help(model.t("クリックして右キー・左キーを切り替え", "Click to toggle Left/Right key"))
 
                     Image(systemName: "chevron.right").foregroundStyle(.secondary)
+
                     Button {
                         model.choosePDFSaveDirectory()
                     } label: {
-                        topologyCard(model.t("保存先", "Save To"), symbol: "folder", detail: model.fetchedPDFRoot.lastPathComponent)
+                        topologyCard(model.t("③ 保存先", "③ Save To"), symbol: "folder", detail: model.fetchedPDFRoot.lastPathComponent)
                     }
                     .buttonStyle(.plain)
                     .help(model.t("クリックして保存先フォルダを変更", "Click to choose save folder"))
+
+                    Image(systemName: "chevron.right").foregroundStyle(.secondary)
+
+                    Button {
+                        if model.canFetchURL {
+                            model.fetchPDFfromURL()
+                        } else {
+                            isSourceURLFocused = true
+                        }
+                    } label: {
+                        topologyCard(
+                            model.t("④ PDF保存 / キュー", "④ Save / Queue"),
+                            symbol: "arrow.down.doc.fill",
+                            detail: model.canFetchURL ? model.t("クリックで開始", "Click to Start") : model.t("URL入力待ち", "Enter URL")
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .help(model.t("クリックしてPDF保存を実行", "Click to create PDF"))
                 }
                 .padding(20)
                 .frame(maxWidth: .infinity)
@@ -2664,7 +2683,7 @@ struct ContentView: View {
                 GroupBox(model.t("URL取得設定", "Capture Settings")) {
                     VStack(alignment: .leading, spacing: 14) {
                         VStack(alignment: .leading, spacing: 6) {
-                            Text(model.t("ソースURL（PDF / ページ送り対象サイト）", "Source URL (PDF or paginated web viewer)"))
+                            Text(model.t("① ソースURL（PDF / ページ送り対象サイト）", "① Source URL (PDF or paginated web viewer)"))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                             TextField("https://... (PDF / URL)", text: $model.sourceURLText)
@@ -2672,8 +2691,23 @@ struct ContentView: View {
                                 .focused($isSourceURLFocused)
                         }
 
+                        HStack(spacing: 12) {
+                            Text(model.t("② ページ送り方向", "② Page Turn Key"))
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                            Picker(model.t("② ページ送り方向", "② Page Turn Key"), selection: $model.pageTurnDirection) {
+                                ForEach(AppModel.PageTurnDirection.allCases) { dir in
+                                    Text(dir.label).tag(dir)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                            .frame(maxWidth: 220)
+                            Spacer()
+                        }
+
                         HStack(spacing: 8) {
-                            Text(model.t("保存先フォルダ", "Save Folder"))
+                            Text(model.t("③ 保存先フォルダ", "③ Save Folder"))
                                 .font(.callout)
                                 .foregroundStyle(.secondary)
                             Text(model.fetchedPDFRoot.path)
@@ -2691,37 +2725,17 @@ struct ContentView: View {
                             }
                         }
 
-                        HStack(spacing: 12) {
-                            Text(model.t("ページ送り方向", "Page Turn Key"))
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                            Picker(model.t("ページ送り方向", "Page Turn Key"), selection: $model.pageTurnDirection) {
-                                ForEach(AppModel.PageTurnDirection.allCases) { dir in
-                                    Text(dir.label).tag(dir)
-                                }
-                            }
-                            .pickerStyle(.segmented)
-                            .labelsHidden()
-                            .frame(maxWidth: 220)
-                            Spacer()
-                        }
-
                         HStack(spacing: 10) {
-                            Button(model.t("URLからPDF作成", "Create PDF")) {
+                            Button(model.t("④ URLからPDF作成", "④ Create PDF")) {
                                 model.fetchPDFfromURL()
                             }
                             .buttonStyle(.borderedProminent)
                             .disabled(!model.canFetchURL)
 
-                            Button(model.t("＋ キューに追加", "+ Add to Queue")) {
+                            Button(model.t("④ ＋ キューに追加", "④ + Add to Queue")) {
                                 model.enqueueCurrentURL()
                             }
                             .disabled(!model.canEnqueueURL)
-
-                            Button(model.t("ログイン用ブラウザを開く", "Open Login Browser")) {
-                                model.launchLoginBrowser()
-                            }
-                            .disabled(model.isRunning)
 
                             if model.isRunning {
                                 Button(model.t("キャンセル", "Cancel"), role: .destructive) {
@@ -2730,9 +2744,16 @@ struct ContentView: View {
                             }
                         }
 
-                        Text(model.t("認証が必要なサイトは「ログイン用ブラウザを開く」からログイン後に実行してください。", "For sites requiring sign-in, open the Login Browser, sign in, and then create the PDF."))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        HStack(spacing: 10) {
+                            Button(model.t("専用Chromeを開く（事前ログイン）", "Open Dedicated Chrome (Sign In)")) {
+                                model.launchLoginBrowser()
+                            }
+                            .disabled(model.isRunning)
+
+                            Text(model.t("このアプリが自動操作するための専用Chromeを開きます。Kindle / O'Reilly などログインが必要なサイトは、ここから事前にログインしてください。", "Opens the dedicated Chrome browser controlled by this app. Sign in here beforehand for sites requiring authentication (e.g. Kindle / O'Reilly)."))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                     .padding(8)
                 }

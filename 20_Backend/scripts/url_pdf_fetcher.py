@@ -306,7 +306,7 @@ def inject_print_cleanup(page) -> dict:
                                     margin: 0 !important; padding: 0 !important;
                                     background: #fff !important; overflow: visible !important;
                                 }
-                                header, nav, footer { display: none !important; }
+                                header, nav, footer, [data-testid="alternativeFormatCallout"], [class*="alternativeFormatCallout" i] { display: none !important; }
                                 #sbo-rt-content, #pdf-main, .pdf-page {
                                     margin: 0 !important; padding: 0 !important;
                                     transform: none !important; width: ${w}px !important;
@@ -368,6 +368,8 @@ def inject_print_cleanup(page) -> dict:
                         }
                         header, nav, footer, aside,
                         [role="complementary"], [role="navigation"], [role="banner"],
+                        [data-testid="alternativeFormatCallout"],
+                        [class*="alternativeFormatCallout" i],
                         [class*="other-formats" i] {
                             display: none !important;
                         }

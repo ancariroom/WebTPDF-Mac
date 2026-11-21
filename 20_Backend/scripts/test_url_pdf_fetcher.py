@@ -162,6 +162,7 @@ class UrlPdfFetcherTests(unittest.TestCase):
               <div style="display:flex;">
                 <main id="sbo-rt-content" style="width:300px;">
                   <section class="_contentContainer_test _sidebarIsOpen_test">
+                    <div data-testid="alternativeFormatCallout">Other formats available Audiobook</div>
                     <h1>Main Chapter Title</h1>
                     <p>READER_BODY_CONTENT_LINE</p>
                   </section>
@@ -306,6 +307,7 @@ class UrlPdfFetcherTests(unittest.TestCase):
         self.assertIn("READER_BODY_CONTENT_LINE", text)
         self.assertNotIn("SIDEBAR_EXPLANATION_SHOULD_HIDE", text)
         self.assertNotIn("TOP_BANNER_SHOULD_HIDE", text)
+        self.assertNotIn("Other formats available", text)
 
     def test_blank_page_raises_error_instead_of_saving_white_pdf(self) -> None:
         out_pdf = self.root / "out_blank.pdf"

@@ -2494,8 +2494,8 @@ struct ContentView: View {
             case .runtime: return lang == .ja ? "実行環境" : "Runtime"
             case .dashboard: return lang == .ja ? "ダッシュボード" : "Dashboard"
             case .urlToPDF: return lang == .ja ? "URL → PDF 作成" : "URL to PDF"
-            case .pdfSqueezer: return lang == .ja ? "PDF圧縮 (Squeezer)" : "PDF Squeezer"
-            case .audioLab: return lang == .ja ? "音声変換 (Audio Lab)" : "Audio Lab"
+            case .pdfSqueezer: return lang == .ja ? "PDF圧縮" : "PDF Squeezer"
+            case .audioLab: return lang == .ja ? "音声変換" : "Audio Lab"
             case .library: return lang == .ja ? "PDFライブラリ" : "PDF Library"
             case .models: return lang == .ja ? "AI接続" : "AI Connection"
             case .logs: return lang == .ja ? "ログ" : "Logs"
@@ -2562,22 +2562,6 @@ struct ContentView: View {
             }
             .navigationTitle("WebTPDF Mac")
             .navigationSplitViewColumnWidth(min: 195, ideal: 215, max: 260)
-            .safeAreaInset(edge: .bottom) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Label(
-                        model.isRunning ? model.t("処理中...", "Running...") : model.statusMessage,
-                        systemImage: model.isRunning ? "record.circle" : (model.dockerReady ? "checkmark.circle" : "pause.circle")
-                    )
-                    .font(.callout)
-                    .lineLimit(1)
-                    Text("TTS: Ready · LLM: \(model.ollamaStatusMessage)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding()
-            }
         } detail: {
             Group {
                 switch destination ?? .dashboard {
@@ -2775,30 +2759,6 @@ struct ContentView: View {
                 queueSection
 
                 fetchHistorySection
-
-                GroupBox(model.t("準備状況・保存結果", "Status & Result")) {
-                    VStack(spacing: 0) {
-                        StatusRow(title: model.t("ステータス", "Status"), value: model.statusMessage, symbol: "info.circle")
-                        Divider()
-                        StatusRow(title: model.t("経過時間", "Elapsed"), value: model.elapsedText, symbol: "clock")
-                        Divider()
-                        StatusRow(title: model.t("保存済みPDF", "Saved PDF"), value: model.fetchedPDFURL?.path ?? model.t("未作成", "None"), symbol: "doc.fill")
-                    }
-                    if model.isRunning {
-                        ProgressView()
-                            .padding(.top, 8)
-                    }
-                    if model.fetchedPDFURL != nil {
-                        HStack {
-                            Button(model.t("保存したPDFを開く", "Open Saved PDF")) {
-                                model.openFetchedPDF()
-                            }
-                            .buttonStyle(.bordered)
-                            Spacer()
-                        }
-                        .padding(.top, 8)
-                    }
-                }
 
                 logBox(minHeight: 180)
             }
@@ -3058,39 +3018,6 @@ struct ContentView: View {
                         model.cancelJob()
                     }
                     .disabled(!model.isRunning)
-                }
-
-                GroupBox(model.t("変換結果", "Output")) {
-                    VStack(spacing: 0) {
-                        StatusRow(title: "ステータス", value: model.statusMessage, symbol: "waveform")
-                        Divider()
-                        StatusRow(title: "経過 / 進捗 / 残り", value: "\(model.elapsedText) · \(model.progressText) · \(model.remainingText)", symbol: "gauge.with.dots.needle.33percent")
-                        Divider()
-                        StatusRow(title: "生成ファイル", value: model.artifactURL?.lastPathComponent ?? "-", symbol: "music.note")
-                        Divider()
-                        StatusRow(title: "出力フォルダ", value: model.outputDirectory?.path ?? "-", symbol: "folder")
-                    }
-                    if let progressFraction = model.progressFraction {
-                        ProgressView(value: progressFraction)
-                            .padding(.top, 8)
-                    } else if model.isRunning {
-                        ProgressView()
-                            .padding(.top, 8)
-                    }
-                    HStack {
-                        Button(model.isPlaying ? "停止" : "再生") {
-                            model.togglePlayback()
-                        }
-                        .disabled(model.artifactURL == nil)
-
-                        Button("ファイルを開く") {
-                            model.openArtifact()
-                        }
-                        .disabled(model.artifactURL == nil)
-
-                        Spacer()
-                    }
-                    .padding(.top, 8)
                 }
 
                 logBox(minHeight: 160)
@@ -3356,6 +3283,8 @@ struct ContentView: View {
                 dashboardRuntimeBox
 
                 fetchHistorySection
+
+                logBox(minHeight: 160)
             }
             .padding(28)
         }
@@ -3481,18 +3410,6 @@ struct ContentView: View {
                         }
                     }
                     .padding(8)
-                }
-
-                GroupBox(model.t("進捗・ステータス", "Status")) {
-                    VStack(spacing: 0) {
-                        StatusRow(title: model.t("ステータス", "Status"), value: model.statusMessage, symbol: "info.circle")
-                        Divider()
-                        StatusRow(title: model.t("経過時間", "Elapsed"), value: model.elapsedText, symbol: "clock")
-                    }
-                    if model.isRunning {
-                        ProgressView()
-                            .padding(.top, 8)
-                    }
                 }
 
                 logBox(minHeight: 220)
@@ -3623,14 +3540,12 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("環境・実行ログ")
                         .font(.title2.bold())
-                    Text("Docker 接続状態と直近の実行ログを確認します。")
+                    Text("直近の実行ログと出力先を確認します。")
                         .foregroundStyle(.secondary)
                 }
 
                 GroupBox("環境ステータス") {
                     VStack(spacing: 0) {
-                        StatusRow(title: "Docker", value: model.dockerStatus, symbol: "shippingbox")
-                        Divider()
                         StatusRow(title: "取得済みPDF", value: model.fetchedPDFURL?.path ?? "-", symbol: "doc.fill")
                         Divider()
                         StatusRow(title: "出力フォルダ", value: model.outputDirectory?.path ?? "-", symbol: "folder")
